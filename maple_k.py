@@ -83,10 +83,10 @@ class Monitor(Node):
 
         self.logger.info("MONITOR: captured %s (brightness=%.1f)",
                          os.path.basename(ref["frame_path"]), ref["brightness"])
-        self.publish_event(event_key="new_data")
+        self.publish_event(event_key="observation_recorded")
 
     def register_callbacks(self):
-        self.register_event_callback(event_key="SensorData", callback=self.monitor)
+        self.register_event_callback(event_key="sensor_data_received", callback=self.monitor)
 
 
 # ===========================================================================
@@ -145,10 +145,10 @@ class Analysis(Node):
             self.write_knowledge(in_planning)
             self.logger.warning("ANALYZE: anomaly! avg %.3f > threshold %.3f -> trigger Plan",
                                 avg, ss.CORE.entropy_threshold)
-            self.publish_event(event_key="anomaly")
+            self.publish_event(event_key="anomaly_detected")
 
     def register_callbacks(self):
-        self.register_event_callback(event_key="new_data", callback=self.analysis)
+        self.register_event_callback(event_key="observation_recorded", callback=self.analysis)
 
 
 # ===========================================================================
@@ -176,10 +176,11 @@ class Plan(Node):
 
         self.logger.info("PLAN: proposing candidate model %s (%s)",
                          candidate.model_id, candidate.reason)
-        self.publish_event(event_key="new_plan")
+        self.publish_event(event_key="plan_generated")
 
     def register_callbacks(self):
-        self.register_event_callback(event_key="anomaly", callback=self.planner)
+        self.register_event_callback(event_key="anomaly_detected", callback=self.planner)
+        self.register_event_callback(event_key="plan_rejected", callback=self.planner)
 
 
 # ===========================================================================
@@ -221,7 +222,7 @@ class Legitimate(Node):
             self.write_knowledge(replans)
             self.logger.info("LEGITIMATE: candidate avg %.3f < current %.3f -> ACCEPT",
                              candidate_avg, run_avg.value)
-            self.publish_event(event_key="isLegit")
+            self.publish_event(event_key="plan_validated")
         else:
             result.is_legit = False
             self.write_knowledge(result)
@@ -232,7 +233,7 @@ class Legitimate(Node):
             if replans.count <= ss.CORE.max_replans:
                 self.logger.warning("LEGITIMATE: reject (cand %s >= cur %s) -> re-plan #%d",
                                     ca, cur, replans.count)
-                self.publish_event(event_key="anomaly")
+                self.publish_event(event_key="plan_rejected")
             else:
                 in_planning = self.read_knowledge(InPlanning)
                 in_planning.in_planning = False
@@ -241,7 +242,7 @@ class Legitimate(Node):
                                   ss.CORE.max_replans)
 
     def register_callbacks(self):
-        self.register_event_callback(event_key="new_plan", callback=self.legitimizer)
+        self.register_event_callback(event_key="plan_generated", callback=self.legitimizer)
 
 
 # ===========================================================================
@@ -290,10 +291,10 @@ class Execute(Node):
 
         self.logger.info("EXECUTE: swapped to model %s and reset entropy window",
                          result.candidate_model_id)
-        self.publish_event(event_key="action_command")
+        self.publish_event(event_key="plan_executed")
 
     def register_callbacks(self):
-        self.register_event_callback(event_key="isLegit", callback=self.executer)
+        self.register_event_callback(event_key="plan_validated", callback=self.executer)
 
 
 # ===========================================================================

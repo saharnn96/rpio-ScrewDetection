@@ -8,8 +8,8 @@ replacement that runs everything in a single process.
 
 Differences from real rpclpy (intentional, for offline simulation):
   * The event bus is SYNCHRONOUS: `publish_event(k)` invokes every registered
-    callback for `k` inline, on the caller's stack. So one `SensorData` emit
-    drives the whole Monitor->Analysis->Plan->Legitimate->Execute chain to
+    callback for `k` inline, on the caller's stack. So one `sensor_data_received`
+    emit drives the whole Monitor->Analysis->Plan->Legitimate->Execute chain to
     completion before returning. With real redis the same chain runs
     asynchronously across processes; the per-node logic is identical.
   * The knowledge store is a plain in-memory dict keyed by class name. With

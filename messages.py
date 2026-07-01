@@ -87,7 +87,7 @@ class ReplanningCounter:
 
 
 class LegitResult:
-    """Outcome of Legitimate's validation (the /isLegit data payload)."""
+    """Outcome of Legitimate's validation (the /plan_validated data payload)."""
     name = "LegitResult"
 
     def __init__(self):
@@ -98,7 +98,7 @@ class LegitResult:
 
 
 class ActionCommand:
-    """The action Execute applied to the live system (the /action_command payload)."""
+    """The action Execute applied to the live system (the /plan_executed payload)."""
     name = "ActionCommand"
 
     def __init__(self):

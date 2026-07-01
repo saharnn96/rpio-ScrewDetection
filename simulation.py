@@ -29,8 +29,8 @@ from messages import ActionCommand
 # Fake "sensor" that pumps the loop.
 #
 # In real deployment the UR robot's XMLRPC call plays this role - see
-# `real_main.py` for the bridge. In sim, we just emit SensorData events on a
-# fixed cadence.
+# `real_main.py` for the bridge. In sim, we just emit sensor_data_received
+# events on a fixed cadence.
 # ---------------------------------------------------------------------------
 class SensorPublisher(Node):
     def __init__(self, config=None, verbose=True):
@@ -40,7 +40,7 @@ class SensorPublisher(Node):
     def emit(self, detection_type, tcp_pose):
         payload = json.dumps({"detection_type": detection_type,
                               "tcp_pose": tcp_pose})
-        self.publish_event(event_key="SensorData", message=payload)
+        self.publish_event(event_key="sensor_data_received", message=payload)
 
 
 def main(num_ticks=24, interval=0.05):
@@ -79,7 +79,7 @@ def main(num_ticks=24, interval=0.05):
 
     run_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
 
-    print("\nDriving SensorData ticks (lighting goes dim at tick 12)...\n")
+    print("\nDriving sensor_data_received ticks (lighting goes dim at tick 12)...\n")
     for tick in range(num_ticks):
         print(f"\n---------- tick {tick:02d} ----------")
         sensor.emit(detection_type="pc_screen", tcp_pose=rtde.get_tcp_pose())

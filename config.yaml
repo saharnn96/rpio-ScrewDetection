@@ -2,12 +2,13 @@
 # MAPLE-K Config for the screw-detection simulation
 #
 # Event flow:
-#   SensorData (from Sensor)  --> Monitor    --> new_data
-#   new_data                  --> Analysis   --> anomaly
-#   anomaly                   --> Plan       --> new_plan
-#   new_plan                  --> Legitimate --> isLegit  (accept)
-#                                            --> anomaly  (re-plan loop)
-#   isLegit                   --> Execute    --> action_command
+#   sensor_data_received (from Sensor)  --> Monitor    --> observation_recorded
+#   observation_recorded                --> Analysis   --> anomaly_detected
+#   anomaly_detected                    --> Plan       --> plan_generated
+#   plan_generated                      --> Legitimate --> plan_validated  (accept)
+#                                                       --> plan_rejected  (re-plan loop)
+#   plan_rejected                       --> Plan       --> plan_generated
+#   plan_validated                      --> Execute    --> plan_executed
 #
 # The offline `local_bus` shim ignores redis / topics / QoS and dispatches
 # in-process. Those fields are kept so this file works unchanged with real
@@ -40,17 +41,17 @@ Monitor_Config:
     properties:
       - property:
           type: event
-          name: SensorData
+          name: sensor_data_received
           class: "-"
-          topic: /SensorData
+          topic: /sensor_data_received
           QoS: 10
   eventOut:
     properties:
       - property:
           type: event
-          name: new_data
+          name: observation_recorded
           class: "-"
-          topic: /new_data
+          topic: /observation_recorded
           QoS: 10
   Event_Manager_Config:
     protocol: redis
@@ -110,17 +111,17 @@ Analysis_Config:
     properties:
       - property:
           type: event
-          name: new_data
+          name: observation_recorded
           class: "-"
-          topic: /new_data
+          topic: /observation_recorded
           QoS: 10
   eventOut:
     properties:
       - property:
           type: event
-          name: anomaly
+          name: anomaly_detected
           class: "-"
-          topic: /anomaly
+          topic: /anomaly_detected
           QoS: 10
   Event_Manager_Config:
     protocol: redis
@@ -174,17 +175,23 @@ Plan_Config:
     properties:
       - property:
           type: event
-          name: anomaly
+          name: anomaly_detected
           class: "-"
-          topic: /anomaly
+          topic: /anomaly_detected
+          QoS: 10
+      - property:
+          type: event
+          name: plan_rejected
+          class: "-"
+          topic: /plan_rejected
           QoS: 10
   eventOut:
     properties:
       - property:
           type: event
-          name: new_plan
+          name: plan_generated
           class: "-"
-          topic: /new_plan
+          topic: /plan_generated
           QoS: 10
   Event_Manager_Config:
     protocol: redis
@@ -238,23 +245,23 @@ Legitimate_Config:
     properties:
       - property:
           type: event
-          name: new_plan
+          name: plan_generated
           class: "-"
-          topic: /new_plan
+          topic: /plan_generated
           QoS: 10
   eventOut:
     properties:
       - property:
           type: event
-          name: isLegit
+          name: plan_validated
           class: "-"
-          topic: /isLegit
+          topic: /plan_validated
           QoS: 10
       - property:
           type: event
-          name: anomaly
+          name: plan_rejected
           class: "-"
-          topic: /anomaly
+          topic: /plan_rejected
           QoS: 10
   Event_Manager_Config:
     protocol: redis
@@ -308,17 +315,17 @@ Execute_Config:
     properties:
       - property:
           type: event
-          name: isLegit
+          name: plan_validated
           class: "-"
-          topic: /isLegit
+          topic: /plan_validated
           QoS: 10
   eventOut:
     properties:
       - property:
           type: event
-          name: action_command
+          name: plan_executed
           class: "-"
-          topic: /action_command
+          topic: /plan_executed
           QoS: 10
   Event_Manager_Config:
     protocol: redis

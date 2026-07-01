@@ -13,8 +13,8 @@ To run in the field:
     python real_main.py
 
 NOTE - The XMLRPC bridge here is a SKELETON. It shows how the synchronous UR
-pendant call gets mapped to a SensorData event and how the caller is
-unblocked when Execute publishes `action_command`. You will still need to
+pendant call gets mapped to a sensor_data_received event and how the caller is
+unblocked when Execute publishes `plan_executed`. You will still need to
 port the coordinate-transform helpers from the original
 `python/screwSegmentation.py` (`calc_img_point_to_base_frame`,
 `get_coordinates_list`, etc.) onto the core so `get_detected_object_coords`
@@ -33,8 +33,9 @@ from maple_k import Node, build_nodes, run_dashboard, USING_REAL_RPCLPY
 
 
 # ---------------------------------------------------------------------------
-# XMLRPC bridge - turns the pendant's blocking RPC call into a SensorData
-# event, then waits for the corresponding action_command before returning.
+# XMLRPC bridge - turns the pendant's blocking RPC call into a
+# sensor_data_received event, then waits for the corresponding plan_executed
+# event before returning.
 # ---------------------------------------------------------------------------
 class RobotBridge(Node):
     """Bridges the synchronous UR XMLRPC contract to the async event bus."""
@@ -46,20 +47,20 @@ class RobotBridge(Node):
 
     def register_callbacks(self):
         self.register_event_callback(
-            event_key="action_command",
+            event_key="plan_executed",
             callback=lambda msg: self._done.set(),
         )
 
     def take_new_image_and_detect(self, tcp_pose, detection_type_string,
                                   screw_fixture=False, save_detections=True,
                                   region_of_interest_type_screw=True):
-        """Called by the UR pendant. Blocks until Execute publishes action_command."""
+        """Called by the UR pendant. Blocks until Execute publishes plan_executed."""
         self._done.clear()
         payload = json.dumps({
             "detection_type": detection_type_string,
             "tcp_pose": tcp_pose,
         })
-        self.publish_event(event_key="SensorData", message=payload)
+        self.publish_event(event_key="sensor_data_received", message=payload)
         if not self._done.wait(timeout=30.0):
             raise TimeoutError("MAPLE-K cycle did not complete in 30s")
         return None  # coords fetched via get_detected_object_coords

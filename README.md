@@ -53,7 +53,7 @@ brightness math → Layer 2 or the adapter. Camera / robot / model not talking
 | `screwSegmentation.py` | **Layer 2** | `ScrewDetectionCore` (application primitives) + `DetectionResult` / `DetectionClasses` / `DetectionModels` + the module-level `CORE` singleton set by the entry point. |
 | `sim_adapters.py` | **Layer 1** | `SimulatedCamera`, `SimulatedRTDE`, `SimulatedDetector`. Zero hardware deps. |
 | `real_adapters.py` | **Layer 1** | `RealCamera`, `RealRTDE`, `RealDetector`. Lazy-imports pyrealsense2 / RTDEReceive / ultralytics / deepluq inside the classes. |
-| `simulation.py` | entry | Wires `sim_adapters` + core + nodes, drives 24 SensorData ticks. |
+| `simulation.py` | entry | Wires `sim_adapters` + core + nodes, drives 24 sensor_data_received ticks. |
 | `real_main.py` | entry | Wires `real_adapters` + core + nodes + `RobotBridge` (XMLRPC server that bridges the UR pendant's blocking call to the event bus). |
 | `config.yaml` | shared | rpclpy config (topics, QoS, redis endpoints). Offline shim ignores most of it; kept intact so the same nodes run distributed. |
 | `requirements.txt` | shared | Minimal offline deps; real-hardware deps commented for the field. |
@@ -71,7 +71,7 @@ python simulation.py
 Around tick ~12 the simulated lighting drops and you should see, in order:
 
 1. `ANALYZE` running-average entropy climbs above `0.5`.
-2. `ANALYZE` emits `anomaly`.
+2. `ANALYZE` emits `anomaly_detected`.
 3. `PLAN` proposes candidate model id `2`.
 4. `LEGITIMATE` re-tests model 2 on the rolling images, accepts the swap.
 5. `EXECUTE` commits the swap; subsequent ticks show low entropy again.
@@ -115,10 +115,10 @@ Depth is omitted — the adaptation loop doesn't use it.
 Tool current and runtime state are dropped (unused in the loop).
 
 The pendant's blocking XMLRPC call is replaced in the sim by
-`simulation.SensorPublisher.emit()`, which publishes a `SensorData` event
-carrying `{detection_type, tcp_pose}`. This is the same pattern
+`simulation.SensorPublisher.emit()`, which publishes a `sensor_data_received`
+event carrying `{detection_type, tcp_pose}`. This is the same pattern
 `real_main.RobotBridge` uses for real deployment — turning the sync RPC
-into an event and blocking on the corresponding `action_command`.
+into an event and blocking on the corresponding `plan_executed`.
 
 ### 3. YOLO + UQ — `SimulatedDetector` (replaces `ultralytics.YOLO` + `run_uq`)
 `detect(image, model_id)` returns one holder + one screw `DetectionResult`
@@ -147,8 +147,8 @@ Two properties fall out of this and matter for the trust check:
 Not hardware, but same idea: an interface swap. `local_bus.Node` provides
 `write_knowledge` / `read_knowledge` / `publish_event` /
 `register_event_callback` / `start` with identical signatures. Publish is
-synchronous (one `SensorData` emit drives the whole chain on one stack).
-`maple_k.py` imports real rpclpy if present, this shim otherwise.
+synchronous (one `sensor_data_received` emit drives the whole chain on one
+stack). `maple_k.py` imports real rpclpy if present, this shim otherwise.
 
 ---
 
@@ -156,15 +156,27 @@ synchronous (one `SensorData` emit drives the whole chain on one stack).
 
 | Phase | Node | Reads (knowledge) | Writes (knowledge) | Publishes |
 |---|---|---|---|---|
-| **M** Monitor | `Monitor.monitor` | `ActiveModel` | `FrameRef` | `new_data` |
-| **A** Analyze | `Analysis.analysis` | `FrameRef`, `ActiveModel`, `EntropyHistory`, `InPlanning` | `Detections`, `EntropyHistory`, `RunningAvgEntropy`, `InPlanning` | `anomaly` (only if avg > threshold + not already adapting) |
-| **P** Plan | `Plan.planner` | `ActiveModel`, `ReplanningCounter` | `CandidateModel` | `new_plan` |
-| **L** Legitimate | `Legitimate.legitimizer` | `CandidateModel`, `RunningAvgEntropy`, rolling images on disk | `LegitResult`, `ReplanningCounter` | `isLegit` on accept, `anomaly` on reject (with `max_replans` guard) |
-| **E** Execute | `Execute.executer` | `LegitResult`, `FrameRef`, `Detections` | `ActionCommand`, `ActiveModel`, `EntropyHistory` (reset), `InPlanning=False` | `action_command` |
+| **M** Monitor | `Monitor.monitor` | `ActiveModel` | `FrameRef` | `observation_recorded` |
+| **A** Analyze | `Analysis.analysis` | `FrameRef`, `ActiveModel`, `EntropyHistory`, `InPlanning` | `Detections`, `EntropyHistory`, `RunningAvgEntropy`, `InPlanning` | `anomaly_detected` (only if avg > threshold + not already adapting) |
+| **P** Plan | `Plan.planner` | `ActiveModel`, `ReplanningCounter` | `CandidateModel` | `plan_generated` |
+| **L** Legitimate | `Legitimate.legitimizer` | `CandidateModel`, `RunningAvgEntropy`, rolling images on disk | `LegitResult`, `ReplanningCounter` | `plan_validated` on accept, `plan_rejected` on reject (with `max_replans` guard) |
+| **E** Execute | `Execute.executer` | `LegitResult`, `FrameRef`, `Detections` | `ActionCommand`, `ActiveModel`, `EntropyHistory` (reset), `InPlanning=False` | `plan_executed` |
 | **K** Knowledge | (shared) | — | `knowledge_log.csv` appended per swap | — |
 
 Interesting compared to the original: `Plan.planner` and the model-swap in
 `Execute.executer` do something — in the original both are `pass`.
+
+### Event bus
+
+| Event Key | Published By | Consumed By | Meaning |
+|---|---|---|---|
+| `sensor_data_received` | Managed System / Sensor | Monitor | New sensor reading arrived |
+| `observation_recorded` | Monitor | Analysis | Observation stored, ready for anomaly check |
+| `anomaly_detected` | Analysis | Plan | Detection window exceeded threshold |
+| `plan_generated` | Plan | Legitimate | New plan/model is ready for validation |
+| `plan_rejected` | Legitimate | Plan | Validation failed, re-planning required |
+| `plan_validated` | Legitimate | Execute | Plan passed validation, safe to deploy |
+| `plan_executed` | Execute | Managed System | Plan deployed, monitoring resumed |
 
 ---
 

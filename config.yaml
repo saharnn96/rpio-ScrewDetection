@@ -1,0 +1,335 @@
+# ============================================================
+# MAPLE-K Config for the screw-detection simulation
+#
+# Event flow:
+#   SensorData (from Sensor)  --> Monitor    --> new_data
+#   new_data                  --> Analysis   --> anomaly
+#   anomaly                   --> Plan       --> new_plan
+#   new_plan                  --> Legitimate --> isLegit  (accept)
+#                                            --> anomaly  (re-plan loop)
+#   isLegit                   --> Execute    --> action_command
+#
+# The offline `local_bus` shim ignores redis / topics / QoS and dispatches
+# in-process. Those fields are kept so this file works unchanged with real
+# rpclpy + redis.
+# ============================================================
+
+Monitor_Config:
+  Logger_Config:
+    log_level: INFO
+    logger_type: terminal
+    format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    terminal: {}
+    file:
+      filename: MAPLE.log
+    redis:
+      host: localhost
+      port: 6379
+      channel: Monitor:logs
+  knowledgeIn:
+    properties: null
+  knowledgeOut:
+    properties:
+      - property:
+          type: data
+          name: FrameRef
+          class: FrameRef
+          topic: /frame_ref
+          QoS: 10
+  eventIn:
+    properties:
+      - property:
+          type: event
+          name: SensorData
+          class: "-"
+          topic: /SensorData
+          QoS: 10
+  eventOut:
+    properties:
+      - property:
+          type: event
+          name: new_data
+          class: "-"
+          topic: /new_data
+          QoS: 10
+  Event_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Message_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Knowledge_Config:
+    knowledge_type: redis
+    host: localhost
+    port: 6379
+    db: 0
+
+Analysis_Config:
+  Logger_Config:
+    log_level: INFO
+    logger_type: terminal
+    format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    terminal: {}
+    file:
+      filename: MAPLE.log
+    redis:
+      host: localhost
+      port: 6379
+      channel: Analysis:logs
+  knowledgeIn:
+    properties:
+      - property:
+          type: data
+          name: FrameRef
+          class: FrameRef
+          topic: /frame_ref
+          QoS: 10
+  knowledgeOut:
+    properties:
+      - property:
+          type: data
+          name: Detections
+          class: Detections
+          topic: /detections
+          QoS: 10
+      - property:
+          type: data
+          name: EntropyHistory
+          class: EntropyHistory
+          topic: /entropy_history
+          QoS: 10
+      - property:
+          type: data
+          name: RunningAvgEntropy
+          class: RunningAvgEntropy
+          topic: /running_avg_entropy
+          QoS: 10
+  eventIn:
+    properties:
+      - property:
+          type: event
+          name: new_data
+          class: "-"
+          topic: /new_data
+          QoS: 10
+  eventOut:
+    properties:
+      - property:
+          type: event
+          name: anomaly
+          class: "-"
+          topic: /anomaly
+          QoS: 10
+  Event_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Message_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Knowledge_Config:
+    knowledge_type: redis
+    host: localhost
+    port: 6379
+    db: 0
+
+Plan_Config:
+  Logger_Config:
+    log_level: INFO
+    logger_type: terminal
+    format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    terminal: {}
+    file:
+      filename: MAPLE.log
+    redis:
+      host: localhost
+      port: 6379
+      channel: Plan:logs
+  knowledgeIn:
+    properties:
+      - property:
+          type: data
+          name: RunningAvgEntropy
+          class: RunningAvgEntropy
+          topic: /running_avg_entropy
+          QoS: 10
+      - property:
+          type: data
+          name: ActiveModel
+          class: ActiveModel
+          topic: /active_model
+          QoS: 10
+  knowledgeOut:
+    properties:
+      - property:
+          type: data
+          name: CandidateModel
+          class: CandidateModel
+          topic: /candidate_model
+          QoS: 10
+  eventIn:
+    properties:
+      - property:
+          type: event
+          name: anomaly
+          class: "-"
+          topic: /anomaly
+          QoS: 10
+  eventOut:
+    properties:
+      - property:
+          type: event
+          name: new_plan
+          class: "-"
+          topic: /new_plan
+          QoS: 10
+  Event_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Message_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Knowledge_Config:
+    knowledge_type: redis
+    host: localhost
+    port: 6379
+    db: 0
+
+Legitimate_Config:
+  Logger_Config:
+    log_level: INFO
+    logger_type: terminal
+    format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    terminal: {}
+    file:
+      filename: MAPLE.log
+    redis:
+      host: localhost
+      port: 6379
+      channel: Legitimate:logs
+  knowledgeIn:
+    properties:
+      - property:
+          type: data
+          name: CandidateModel
+          class: CandidateModel
+          topic: /candidate_model
+          QoS: 10
+      - property:
+          type: data
+          name: RunningAvgEntropy
+          class: RunningAvgEntropy
+          topic: /running_avg_entropy
+          QoS: 10
+  knowledgeOut:
+    properties:
+      - property:
+          type: data
+          name: LegitResult
+          class: LegitResult
+          topic: /legit_result
+          QoS: 10
+  eventIn:
+    properties:
+      - property:
+          type: event
+          name: new_plan
+          class: "-"
+          topic: /new_plan
+          QoS: 10
+  eventOut:
+    properties:
+      - property:
+          type: event
+          name: isLegit
+          class: "-"
+          topic: /isLegit
+          QoS: 10
+      - property:
+          type: event
+          name: anomaly
+          class: "-"
+          topic: /anomaly
+          QoS: 10
+  Event_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Message_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Knowledge_Config:
+    knowledge_type: redis
+    host: localhost
+    port: 6379
+    db: 0
+
+Execute_Config:
+  Logger_Config:
+    log_level: INFO
+    logger_type: terminal
+    format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    terminal: {}
+    file:
+      filename: MAPLE.log
+    redis:
+      host: localhost
+      port: 6379
+      channel: Execute:logs
+  knowledgeIn:
+    properties:
+      - property:
+          type: data
+          name: LegitResult
+          class: LegitResult
+          topic: /legit_result
+          QoS: 10
+  knowledgeOut:
+    properties:
+      - property:
+          type: data
+          name: ActionCommand
+          class: ActionCommand
+          topic: /action_command
+          QoS: 10
+      - property:
+          type: data
+          name: ActiveModel
+          class: ActiveModel
+          topic: /active_model
+          QoS: 10
+  eventIn:
+    properties:
+      - property:
+          type: event
+          name: isLegit
+          class: "-"
+          topic: /isLegit
+          QoS: 10
+  eventOut:
+    properties:
+      - property:
+          type: event
+          name: action_command
+          class: "-"
+          topic: /action_command
+          QoS: 10
+  Event_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Message_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Knowledge_Config:
+    knowledge_type: redis
+    host: localhost
+    port: 6379
+    db: 0

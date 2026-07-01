@@ -1,45 +1,74 @@
 # maple_k_sim — offline MAPLE-K simulation for screw detection
 
-This folder is a self-contained port of the MAPLE-K loop that lives inside
-`python/screwSegmentation.py` (the `take_new_image_and_detect` method). It:
-
-* Restructures the loop into five discrete `rpclpy` nodes.
-* Provides drop-in fakes for the three hardware dependencies (RealSense camera,
-  UR robot, YOLO + UQ pipeline) so the loop runs on a laptop with no hardware.
-* Ships a fallback in-process event bus so the demo runs without installing
-  `rpclpy` or standing up redis.
-* Fills in the model-swap logic that is currently `pass` in the original code,
-  so the full **Monitor → Analyze → Plan → Legitimate → Execute** chain
-  actually fires end-to-end.
+Self-contained port of the MAPLE-K loop that lives inside
+`python/screwSegmentation.py` (the `take_new_image_and_detect` method),
+restructured into a clean **three-layer architecture** so it can run both
+against a fake camera/robot/model (for debugging the loop on a laptop) and
+against the real hardware (for field deployment) with zero changes to the
+MAPLE-K logic itself.
 
 The main repo is not modified.
 
 ---
 
-## File map
+## The three layers
 
-| File | Role |
-|---|---|
-| `messages.py` | Plain-attribute classes that flow through the knowledge store (`FrameRef`, `EntropyHistory`, `RunningAvgEntropy`, `ActiveModel`, `CandidateModel`, `InPlanning`, `ReplanningCounter`, `LegitResult`, `ActionCommand`). Keep them JSON-friendly — image data never travels through the store, only file paths. |
-| `local_bus.py` | Fallback `Node` / `timeit_callback` / `run_dashboard` that mimic the rpclpy API in-process. Used automatically when `rpclpy` is not installed. |
-| `screwSegmentation_rpio.py` | The port itself: `ScrewDetectionCore` (hardware-agnostic) plus the five `Node` subclasses (`Monitor`, `Analysis`, `Plan`, `Legitimate`, `Execute`). |
-| `simulation.py` | `SimulatedCamera`, `SimulatedRTDE`, `SimulatedDetector`, and the driver `main()` that ticks the loop. Entry point for the demo. |
-| `config.yaml` | Adapted MAPLE-K config (topics, QoS, redis endpoints). The offline shim ignores most of it; kept intact so the same code runs against real rpclpy + redis with zero changes. |
+```
+   ┌──────────────────────────────────────────────────────┐
+   │  Layer 3:  MAPLE-K loop                              │  maple_k.py
+   │  The five rpclpy Nodes: Monitor, Analysis, Plan,     │
+   │  Legitimate, Execute. Read/write knowledge.          │
+   │  Publish events. Call into the core. No hardware.    │
+   ├──────────────────────────────────────────────────────┤
+   │  Layer 2:  Application (screwSegmentation)           │  screwSegmentation.py
+   │  ScrewDetectionCore + adapter interfaces + domain    │
+   │  types (DetectionResult, DetectionClasses,           │
+   │  DetectionModels). Hardware-agnostic.                │
+   ├──────────────────────────────────────────────────────┤
+   │  Layer 1:  Adapters (hardware)                       │  sim_adapters.py
+   │  SimulatedCamera / SimulatedRTDE / SimulatedDetector │  real_adapters.py
+   │  RealCamera     / RealRTDE     / RealDetector        │
+   │  Only place that touches pyrealsense2, ur_rtde,      │
+   │  ultralytics, deepluq, ...                           │
+   └──────────────────────────────────────────────────────┘
+
+   Entry points wire the layers:
+     simulation.py  =>  sim_adapters   (offline demo)
+     real_main.py   =>  real_adapters  (field deployment + XMLRPC bridge)
+```
+
+**Debug rule of thumb:** MAPLE-K logic bug → Layer 3. Wrong detection or
+brightness math → Layer 2 or the adapter. Camera / robot / model not talking
+→ Layer 1 only.
 
 ---
 
-## Running the demo
+## File map
 
+| File | Layer | Role |
+|---|---|---|
+| `messages.py` | shared | Plain-attribute classes that flow through the knowledge store (`FrameRef`, `EntropyHistory`, `RunningAvgEntropy`, `ActiveModel`, `CandidateModel`, `InPlanning`, `ReplanningCounter`, `LegitResult`, `ActionCommand`). Image data never goes through here — only file paths. |
+| `local_bus.py` | infra | Fallback for `rpclpy.node.Node` / `timeit_callback` / `run_dashboard` when rpclpy is not installed. In-process, synchronous. Used automatically. |
+| `maple_k.py` | **Layer 3** | The five `Node` subclasses + `build_nodes(config)`. Re-exports `Node`, `timeit_callback`, `run_dashboard` from real rpclpy if available. |
+| `screwSegmentation.py` | **Layer 2** | `ScrewDetectionCore` (application primitives) + `DetectionResult` / `DetectionClasses` / `DetectionModels` + the module-level `CORE` singleton set by the entry point. |
+| `sim_adapters.py` | **Layer 1** | `SimulatedCamera`, `SimulatedRTDE`, `SimulatedDetector`. Zero hardware deps. |
+| `real_adapters.py` | **Layer 1** | `RealCamera`, `RealRTDE`, `RealDetector`. Lazy-imports pyrealsense2 / RTDEReceive / ultralytics / deepluq inside the classes. |
+| `simulation.py` | entry | Wires `sim_adapters` + core + nodes, drives 24 SensorData ticks. |
+| `real_main.py` | entry | Wires `real_adapters` + core + nodes + `RobotBridge` (XMLRPC server that bridges the UR pendant's blocking call to the event bus). |
+| `config.yaml` | shared | rpclpy config (topics, QoS, redis endpoints). Offline shim ignores most of it; kept intact so the same nodes run distributed. |
+| `requirements.txt` | shared | Minimal offline deps; real-hardware deps commented for the field. |
+
+---
+
+## Running
+
+### Offline simulation
 ```bash
 cd maple_k_sim
+pip install -r requirements.txt
 python simulation.py
 ```
-
-Prerequisites: `numpy`, `opencv-python`, `pyyaml`. No CUDA, no realsense, no
-robot, no rpclpy, no redis.
-
-The driver ticks the loop 24 times. Around tick ~12 the simulated lighting
-drops and you should see, in order:
+Around tick ~12 the simulated lighting drops and you should see, in order:
 
 1. `ANALYZE` running-average entropy climbs above `0.5`.
 2. `ANALYZE` emits `anomaly`.
@@ -47,154 +76,108 @@ drops and you should see, in order:
 4. `LEGITIMATE` re-tests model 2 on the rolling images, accepts the swap.
 5. `EXECUTE` commits the swap; subsequent ticks show low entropy again.
 
-Artefacts land in `./_sim_out/` (rolling images, capture snapshots,
-`knowledge_log.csv`).
+Artefacts land in `./_sim_out/`.
+
+### Real hardware (field)
+1. Install the extras in `requirements.txt` (uncomment the `pyrealsense2`,
+   `ultralytics`, `torch`, `deepluq`, `ur_rtde` block).
+2. Point `RealDetector.MODEL_PATHS` at your `.pt` files (`real_adapters.py`).
+3. Finish the XMLRPC bridge in `real_main.py` — `get_detected_object_coords`
+   is a stub; port the coordinate transforms from the original
+   `python/screwSegmentation.py` onto `ScrewDetectionCore`.
+4. Optionally `pip install rpclpy redis` and start a redis server if you
+   want the nodes distributed instead of in-process.
+5. Run:
+   ```bash
+   python real_main.py
+   ```
 
 ---
 
 ## How each hardware dependency is simulated
 
-The original code talks to three physical systems. Each is replaced by a small
-adapter with the same interface the `ScrewDetectionCore` calls into.
+Everything lives in `sim_adapters.py`. Each class satisfies the interface
+documented in `screwSegmentation.py`.
 
 ### 1. Camera — `SimulatedCamera` (replaces `pyrealsense2`)
-
-The real code opens a RealSense pipeline, waits for aligned color+depth
-frames, and pulls per-pixel depth. The simulator only cares about producing a
-BGR image whose brightness drives the MAPLE-K decision — depth is not part of
-the adaptation loop, so it is omitted.
-
-`get_color_image()` returns a synthetic `720×1280×3 uint8` frame:
-
+`get_color_image()` returns a synthetic 720×1280×3 BGR frame:
 * Solid background at `bright_level=150` for the first `drift_after=12` ticks,
-  then `dim_level=45` for the rest — this is the "lighting change" that
-  triggers the anomaly.
-* A red rectangle drawn at the frame centre plays the role of a *holder*.
-* A green circle inside it plays the role of a *screw*.
-* Small uniform noise is added so brightness is not exactly constant.
+  then `dim_level=45`. That brightness swing is the "lighting change" that
+  drives the whole MAPLE-K adaptation.
+* A red rectangle (holder) + green circle (screw) so the saved frames look
+  like a plausible scene.
+* Small uniform noise so brightness isn't exactly constant.
 
-Nothing about the camera is asynchronous; each call advances an internal tick
-counter, which is how the "drift" is scheduled.
+Depth is omitted — the adaptation loop doesn't use it.
 
-### 2. Robot — `SimulatedRTDE` (replaces `RTDEReceive` / the UR pendant)
+### 2. Robot — `SimulatedRTDE` (replaces `RTDEReceive` + XMLRPC)
+`get_tcp_pose()` returns a fixed pose `{x: 0.4, y: 0, z: 0.5, rx: 0, ry: 3.14, rz: 0}`.
+Tool current and runtime state are dropped (unused in the loop).
 
-The real code has two robot interfaces:
-
-* A continuous **RTDE** telemetry stream (TCP pose, tool current, runtime state).
-* An inbound **XMLRPC** command channel where the pendant calls
-  `take_new_image_and_detect(tcp_pose, detection_type)` and blocks on the
-  return.
-
-The simulator replaces both:
-
-* `SimulatedRTDE.get_tcp_pose()` returns a **fixed** TCP pose. Tool current
-  and runtime state are not used inside the MAPLE-K loop, so they are dropped.
-* The blocking XMLRPC call is replaced by `SensorPublisher.emit()`, which
-  publishes a `SensorData` event carrying `{detection_type, tcp_pose}`. This is
-  the pattern I recommended in the earlier bottleneck discussion: turn the
-  synchronous RPC into an event, then let the nodes react.
-
-The pose is fixed because the original TCP pose only affects the
-image-to-base-frame coordinate transform (`calc_img_point_to_base_frame`),
-which is downstream of the adaptation loop. Getting the loop itself to fire
-does not need robot kinematics.
+The pendant's blocking XMLRPC call is replaced in the sim by
+`simulation.SensorPublisher.emit()`, which publishes a `SensorData` event
+carrying `{detection_type, tcp_pose}`. This is the same pattern
+`real_main.RobotBridge` uses for real deployment — turning the sync RPC
+into an event and blocking on the corresponding `action_command`.
 
 ### 3. YOLO + UQ — `SimulatedDetector` (replaces `ultralytics.YOLO` + `run_uq`)
-
-This is the most important fake. The real pipeline runs YOLO with MC-Dropout
-`T=10` times per frame, clusters detections with WBF, and computes classifi-
-cation entropy per detection. It depends on `deepluq`, on a custom YOLO fork
-whose predictions carry a `.detection` attribute, and on `.pt` weight files at
-hardcoded Linux paths. None of those are available in a sim.
-
-`SimulatedDetector.detect(image, model_id)` returns:
-
-* One `HOLDER` and one `SCREW` `DetectionResult` centred on the frame — enough
-  for the `filter_out_detections_not_within_holders` logic and the knowledge
-  log to have real data.
-* A screw entropy computed as:
-  ```
-  brightness = grayscale_mean(image)
-  entropy    = clip(|brightness - optimum[model_id]| / 150, 0.02, 0.95)
-  optimum = {1: 150.0, 2: 50.0}
-  ```
-
-That formula is the whole trick that makes the demo work:
+`detect(image, model_id)` returns one holder + one screw `DetectionResult`
+and a screw entropy computed as a **pure function of the frame's
+brightness**:
+```
+optimum = {1: 150.0, 2: 50.0}
+entropy = clip(|brightness - optimum[model_id]| / 150, 0.02, 0.95)
+```
 
 | brightness | model 1 entropy | model 2 entropy | interpretation |
 |---|---|---|---|
 | 150 (bright) | ~0.02 | ~0.66 | Model 1 is confident; the incumbent is fine. |
 | 45  (dim)    | ~0.70 | ~0.03 | Model 1 loses confidence; model 2 is the right fit. |
 
-Two properties fall out of this that matter for the trustworthiness check:
-
+Two properties fall out of this and matter for the trust check:
 * **Deterministic given the image.** Legitimate re-reads the saved rolling
   frames from disk and re-runs the detector; because entropy is a pure
   function of the pixel values, its assessment is consistent with what
-  Analyze measured live. This mirrors how the real LEGITIMATE region works —
-  it reads the same rolling-average JPEGs back and re-scores them.
-* **Discriminates the two candidates.** After the lighting drift, model 2
-  scores strictly lower entropy than model 1 on the same frames, so
+  Analyze measured live. This mirrors how the real LEGITIMATE region works.
+* **Discriminates the two candidates.** After the drift, model 2 scores
+  strictly lower entropy than model 1 on the same frames, so
   `candidate_avg < current_avg` and the swap is accepted.
 
-`model_id` is a plain integer that Execute mutates on a successful swap.
-
 ### 4. rpclpy — `local_bus.py` (replaces the real distributed bus)
-
 Not hardware, but same idea: an interface swap. `local_bus.Node` provides
 `write_knowledge` / `read_knowledge` / `publish_event` /
-`register_event_callback` / `start` — signatures identical to
-`rpclpy.node.Node`. Two behaviour differences:
-
-* Publish is **synchronous**: one `SensorData` emit drives the entire chain
-  Monitor → Analyze → (Plan → Legitimate → Execute) on the same call stack
-  before returning. In real rpclpy the same chain runs across processes via
-  redis pub/sub. Per-node logic is identical either way.
-* The knowledge store is a plain dict keyed by class name, not a redis db.
-
-`screwSegmentation_rpio.py` picks up real rpclpy if present, or the shim if
-not — nothing else changes.
+`register_event_callback` / `start` with identical signatures. Publish is
+synchronous (one `SensorData` emit drives the whole chain on one stack).
+`maple_k.py` imports real rpclpy if present, this shim otherwise.
 
 ---
 
-## What the MAPLE-K loop does in this simulation
+## What the MAPLE-K loop does per cycle
 
 | Phase | Node | Reads (knowledge) | Writes (knowledge) | Publishes |
 |---|---|---|---|---|
-| **M** Monitor | `Monitor.monitor` | `ActiveModel` | `FrameRef` (path, brightness, TCP pose) | `new_data` |
-| **A** Analyze | `Analysis.analysis` | `FrameRef`, `ActiveModel`, `EntropyHistory`, `InPlanning` | `Detections`, `EntropyHistory`, `RunningAvgEntropy`, `InPlanning` | `anomaly` (only if avg > 0.5 and not already adapting) |
+| **M** Monitor | `Monitor.monitor` | `ActiveModel` | `FrameRef` | `new_data` |
+| **A** Analyze | `Analysis.analysis` | `FrameRef`, `ActiveModel`, `EntropyHistory`, `InPlanning` | `Detections`, `EntropyHistory`, `RunningAvgEntropy`, `InPlanning` | `anomaly` (only if avg > threshold + not already adapting) |
 | **P** Plan | `Plan.planner` | `ActiveModel`, `ReplanningCounter` | `CandidateModel` | `new_plan` |
 | **L** Legitimate | `Legitimate.legitimizer` | `CandidateModel`, `RunningAvgEntropy`, rolling images on disk | `LegitResult`, `ReplanningCounter` | `isLegit` on accept, `anomaly` on reject (with `max_replans` guard) |
-| **E** Execute | `Execute.executer` | `LegitResult`, `FrameRef`, `Detections` | `ActionCommand`, `ActiveModel`, `EntropyHistory` (reset), `InPlanning` (false) | `action_command` |
+| **E** Execute | `Execute.executer` | `LegitResult`, `FrameRef`, `Detections` | `ActionCommand`, `ActiveModel`, `EntropyHistory` (reset), `InPlanning=False` | `action_command` |
 | **K** Knowledge | (shared) | — | `knowledge_log.csv` appended per swap | — |
 
-The interesting bit versus the original code: `Plan.planner` and the
-model-swap in `Execute.executer` **do something** — in the original they are
-still `pass`.
+Interesting compared to the original: `Plan.planner` and the model-swap in
+`Execute.executer` do something — in the original both are `pass`.
 
 ---
 
-## Porting to real hardware / real rpclpy
+## Migration checklist (sim → field)
 
-The core has three injection points. To go live, replace each with a real
-adapter and drop the sim fakes:
-
-| Interface | Sim class | Real adapter to build |
+| # | Task | Files to touch |
 |---|---|---|
-| `camera.get_color_image()` | `SimulatedCamera` | Thin wrapper around the existing `aligned_frames_and_images` from `python/screwSegmentation.py`. |
-| `rtde.get_tcp_pose()` | `SimulatedRTDE` | Wrapper around `RTDEReceive.receive_data()['actual_TCP_pose']`. |
-| `detector.detect(image, model_id)` | `SimulatedDetector` | Owns YOLO instances keyed by `model_id`; calls `run_uq(...)` + `uq_analysis(...)` and returns the same `(list[DetectionResult], screw_entropy)` tuple. |
+| 1 | Point `RealDetector.MODEL_PATHS` at real `.pt` files | `real_adapters.py` |
+| 2 | Port `calc_img_point_to_base_frame` + `get_coordinates_list` from the original onto `ScrewDetectionCore` | `screwSegmentation.py` |
+| 3 | Finish `RobotBridge.get_detected_object_coords` to call the ported transforms | `real_main.py` |
+| 4 | (Optional) `pip install rpclpy redis` + start redis for distributed nodes | none |
+| 5 | Fill in a smarter Plan policy if you want more than one candidate model | `maple_k.py` |
 
-Then either:
-
-* Run `python simulation.py` after swapping `SimulatedCamera/RTDE/Detector`
-  for the real ones (fastest path — reuses the driver and the shim).
-* Install `rpclpy` + start redis and run `python screwSegmentation_rpio.py`
-  once you have wired the `main()` at the bottom of that file to construct
-  the real adapters. The nodes themselves need no change.
-
-The synchronous XMLRPC contract with the UR pendant is the one thing the port
-does **not** solve — see the earlier "Bottleneck 1" discussion. In the current
-sim, `SensorPublisher.emit()` stands in for that call; real deployment needs
-an XMLRPC → event-bus bridge that publishes `SensorData` and then blocks
-waiting for the corresponding `ActionCommand` before returning to the robot.
+**Untouched by field deployment:** all of `maple_k.py`, all of `messages.py`,
+all of `screwSegmentation.py`'s core primitives, all of `config.yaml`. The
+whole point of the layering.

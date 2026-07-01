@@ -1,0 +1,32 @@
+# Minimum runtime dependencies for the offline MAPLE-K screw-detection simulation.
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Then run:
+#   python simulation.py
+#
+# No CUDA, no RealSense SDK, no UR robot libraries, no YOLO weights required.
+
+numpy>=1.20
+opencv-python>=4.5
+PyYAML>=5.4
+
+# ---------------------------------------------------------------------------
+# Optional - only needed to run the same nodes against a real distributed bus
+# instead of the in-process `local_bus` shim. When these are installed AND a
+# redis server is reachable, `screwSegmentation_rpio.py` imports rpclpy
+# automatically and the sim behaves as a real distributed MAPLE-K deployment.
+# ---------------------------------------------------------------------------
+# rpclpy
+# redis>=4.0
+
+# ---------------------------------------------------------------------------
+# Not needed for the simulation - listed here for the real-hardware port only:
+#   pyrealsense2      # RealSense camera SDK (real camera adapter)
+#   ultralytics       # YOLO model runtime (real detector adapter)
+#   torch             # required by ultralytics + run_uq
+#   torchmetrics      # required by run_uq
+#   deepluq           # WBF clustering + UQ metrics used by run_uq
+#   ur_rtde           # UR robot RTDE bindings (real RTDE adapter)
+# ---------------------------------------------------------------------------

@@ -40,10 +40,13 @@ class _Bus:
             callback(message)
 
     def write(self, obj):
-        self.knowledge[type(obj).__name__] = obj
+        # Key by `name` class attr (same convention as real rpclpy).
+        key = getattr(obj, "name", None) or type(obj).__name__
+        self.knowledge[key] = obj
 
     def read(self, cls):
-        return self.knowledge.get(cls.__name__)
+        key = getattr(cls, "name", None) or cls.__name__
+        return self.knowledge.get(key)
 
 
 # Shared across every Node instance (mirrors the shared redis db).

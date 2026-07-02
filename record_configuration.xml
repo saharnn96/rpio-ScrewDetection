@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<rtde_config>
+	<recipe key="out">
+		<field name="timestamp" type="DOUBLE"/>
+		<field name="actual_TCP_pose" type="VECTOR6D"/>
+		<field name="actual_TCP_force" type="VECTOR6D"/>
+		<field name="actual_tool_accelerometer" type="VECTOR3D"/>
+		<field name="tool_output_current" type="DOUBLE"/>
+		<field name="runtime_state" type="UINT32"/>
+	</recipe>
+	<recipe key="watchdog">
+		<field name="input_int_register_0" type="INT32"/>
+	</recipe>
+</rtde_config>

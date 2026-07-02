@@ -105,7 +105,11 @@ class Analysis(Node):
         frame_ref = self.read_knowledge(FrameRef)
         active = self.read_knowledge(ActiveModel)
 
-        detections, screw_entropy = ss.CORE.detect(frame_ref.frame_path, active.model_id)
+        # The task (detection_type) picks the base model; MAPLE-K only owns the
+        # model choice for the adaptive (closeup) task.
+        detection_type = getattr(frame_ref, "detection_type", None)
+        model_id = ss.CORE.resolve_model_id(detection_type, active.model_id)
+        detections, screw_entropy = ss.CORE.detect(frame_ref.frame_path, model_id)
 
         # Store a JSON-friendly detection summary.
         det_msg = Detections()
@@ -118,6 +122,13 @@ class Analysis(Node):
         ]
         det_msg.screw_entropy = float(screw_entropy) if screw_entropy is not None else None
         self.write_knowledge(det_msg)
+
+        # Non-adaptive tasks (topview / screen / fixture) detect and stop here -
+        # no entropy window, no anomaly, no model swap.
+        if not ss.CORE.is_adaptive(detection_type):
+            self.logger.info("ANALYZE: detection_type=%s is non-adaptive (model %s); "
+                             "skipping entropy/anomaly logic", detection_type, model_id)
+            return
 
         if screw_entropy is None:
             self.logger.info("ANALYZE: no single screw/noscrew detection; skipping entropy update")

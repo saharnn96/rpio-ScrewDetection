@@ -16,9 +16,26 @@ TODO for the field:
   * The interfaces here must match those documented in `screwSegmentation.py`.
 """
 
+import os
+
 import numpy as np
 
 from screwSegmentation import DetectionResult, DetectionClasses
+
+# Absolute path to this file's directory (repo root). Everything the real
+# adapters load - vendored RDTEReceive config, model weights - is resolved
+# against this so `real_main.py` works no matter what CWD the UR controller
+# launches it from.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DETECTION_MODEL_DIR = os.path.join(
+    _HERE, "screw_detection", "detection_model"
+)
+
+
+def _detect_weights(*parts):
+    """Absolute path to a detect-run best.pt under the repo's detection_model."""
+    return os.path.join(_DETECTION_MODEL_DIR, "scripts", "runs", "detect",
+                        *parts, "weights", "best.pt")
 
 
 # ---------------------------------------------------------------------------
@@ -59,11 +76,17 @@ class RealRTDE:
     """Wraps RTDEReceive. The original code streams tool_current and
     runtime_state too; only the TCP pose is required by the loop."""
 
-    def __init__(self, robot_ip):
+    def __init__(self, robot_ip, config_file=None):
         # Import path mirrors what the original screwSegmentation.py uses.
         from RDTEReceive.RTDEReceive import RTDEReceive
 
-        self._rtde = RTDEReceive(robot_ip)
+        # RTDEReceive loads its recipe file relative to CWD by default; anchor
+        # it to the vendored copy next to this module so it resolves regardless
+        # of where the process was launched from.
+        if config_file is None:
+            config_file = os.path.join(_HERE, "record_configuration.xml")
+
+        self._rtde = RTDEReceive(robot_ip, config_file=config_file)
         self._rtde.connect_to_robot()
         self._rtde.start_receiving()
 
@@ -85,11 +108,41 @@ class RealDetector:
 
     ENTROPY_THRESHOLD = 0.5  # matches original uq_analysis()
 
-    # TODO: point these at the real .pt files used in your setup.
+    # Model id space (absolute paths, anchored to the repo so they resolve
+    # regardless of CWD). Ids 1 & 2 are the two lighting-calibrated CLOSEUP
+    # variants the MAPLE-K loop swaps between (ActiveModel.model_id carries
+    # these). Ids 3-5 are the fixed per-task models, selected by detection_type
+    # and never touched by the swap logic. Point these at your own weights if
+    # different - id 1 in particular is likely your robot-local closeup model
+    # (the original used /home/.../pc_all_brightnesses_classified_tests).
     MODEL_PATHS = {
-        1: "../detection_model/scripts/runs/detect/real_images_with_noscrews_and_screw_fixture/weights/best.pt",
-        2: "../detection_model/scripts/runs/detect/real_images_with_noscrews_and_screw_fixture_extended/weights/best.pt",
+        1: _detect_weights("real_images_with_noscrews_and_screw_fixture"),
+        2: _detect_weights("real_images_with_noscrews_and_screw_fixture_extended"),
+        3: _detect_weights("real_images_with_noscrews_and_screw_fixture_extended"),
+        5: _detect_weights("real_images_with_noscrews_and_screw_fixture"),
+        # id 4 (screen segmentation) uses a seg model + a different detect path;
+        # see SEG_MODEL_PATHS / detect() below.
     }
+
+    SEG_MODEL_PATHS = {
+        4: os.path.join(_DETECTION_MODEL_DIR, "scripts", "runs", "seg",
+                        "screen_and_screen_frame.pt"),
+    }
+
+    # detection_type string -> base model id (mirrors original change_active_model).
+    DETECTION_TYPE_TO_MODEL = {
+        "pc_screen": 1,                 # adaptive; runtime id may become 2
+        "screw_fixture": 3,
+        "topview": 5,
+        "screen_or_screen_frame": 4,    # seg model - not yet wired end to end
+    }
+
+    # Only the closeup task participates in the MAPLE-K entropy swap loop.
+    ADAPTIVE_DETECTION_TYPES = {"pc_screen"}
+
+    # Bbox-detection ids that run through the run_uq / entropy path. The seg
+    # model (id 4) is intentionally excluded.
+    _BBOX_MODEL_IDS = frozenset(MODEL_PATHS)
 
     def __init__(self, model_id=1, T=10, uq_config=(0,)):
         from ultralytics import YOLO
@@ -98,14 +151,28 @@ class RealDetector:
         self.T = T
         self.uq_config = list(uq_config)
         self._models = {}
+        # Dedup by path: several ids share the same weights file today, so we
+        # only load each file once.
+        loaded_by_path = {}
         for mid, path in self.MODEL_PATHS.items():
-            m = YOLO(path)
-            m.fuse()
-            self._models[mid] = m
+            if path not in loaded_by_path:
+                m = YOLO(path)
+                m.fuse()
+                loaded_by_path[path] = m
+            self._models[mid] = loaded_by_path[path]
 
     def detect(self, image, model_id):
         # Lazy import so this module works without deepluq installed.
         from inference_uq_single_detection import run_uq
+
+        if model_id not in self._BBOX_MODEL_IDS:
+            # Seg model (screen/screen_frame): masks, no UQ, and coordinate
+            # extraction via oriented bboxes - none of that is ported onto the
+            # core yet. Fail loudly rather than silently mis-detecting.
+            raise NotImplementedError(
+                f"model_id={model_id} is a segmentation model; the mask/coord "
+                "path is not ported onto ScrewDetectionCore yet."
+            )
 
         model = self._models[model_id]
         uq_preds = run_uq(model, image, T=self.T,

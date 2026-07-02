@@ -118,6 +118,34 @@ class ScrewDetectionCore:
             "brightness": brightness,
         }
 
+    # --- model routing policy ---------------------------------------------
+    #
+    # Two mechanisms decide which model runs:
+    #   * The *task* (detection_type) picks a base model - topview / screen /
+    #     fixture / closeup - exactly like the original change_active_model().
+    #   * The MAPLE-K entropy loop only adapts the CLOSEUP task, swapping
+    #     between its lighting-calibrated variants (ids 1 <-> 2).
+    #
+    # A detector MAY expose `ADAPTIVE_DETECTION_TYPES` (set[str]) and
+    # `DETECTION_TYPE_TO_MODEL` (dict[str,int]). The SimulatedDetector exposes
+    # neither, so the sim keeps its old behaviour: every frame is "adaptive"
+    # and always uses the MAPLE-K-owned active model id.
+    def is_adaptive(self, detection_type):
+        """True if the MAPLE-K swap loop should run for this detection type."""
+        adaptive = getattr(self.detector, "ADAPTIVE_DETECTION_TYPES", None)
+        return adaptive is None or detection_type in adaptive
+
+    def resolve_model_id(self, detection_type, active_model_id):
+        """Which model id to detect with for this task.
+
+        Closeup (adaptive) -> whatever MAPLE-K currently has active (1 or 2).
+        Other tasks        -> the fixed model bound to that detection type.
+        """
+        if self.is_adaptive(detection_type):
+            return active_model_id
+        mapping = getattr(self.detector, "DETECTION_TYPE_TO_MODEL", {})
+        return mapping.get(detection_type, active_model_id)
+
     # --- ANALYZE / LEGITIMATE primitive -----------------------------------
     def detect(self, frame_path, model_id):
         """Run detection + UQ through the injected detector.

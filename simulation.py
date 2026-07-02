@@ -3,7 +3,7 @@
 Wires the three layers with SIMULATED adapters and drives the MAPLE-K loop:
 
     Layer 3   maple_k          <-- the five Nodes
-    Layer 2   screwSegmentation <-- ScrewDetectionCore
+    Layer 2   detection_core   <-- ScrewDetectionCore
     Layer 1   sim_adapters     <-- SimulatedCamera / SimulatedRTDE / SimulatedDetector
 
 Run:    python simulation.py
@@ -18,8 +18,8 @@ import logging
 import os
 import time
 
-import screwSegmentation as ss
-from screwSegmentation import ScrewDetectionCore
+import detection_core as ss
+from detection_core import ScrewDetectionCore
 from maple_k import Node, build_nodes, run_dashboard, USING_REAL_RPCLPY
 from sim_adapters import SimulatedCamera, SimulatedRTDE, SimulatedDetector
 from messages import ActionCommand

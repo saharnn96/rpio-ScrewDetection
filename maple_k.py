@@ -3,13 +3,13 @@
 This is the TOP layer of the three-layer architecture:
 
     Layer 3 (this file)       -->  Monitor / Analysis / Plan / Legitimate / Execute
-    Layer 2 (application)     -->  screwSegmentation.ScrewDetectionCore
+    Layer 2 (application)     -->  detection_core.ScrewDetectionCore
     Layer 1 (adapters)        -->  sim_adapters.py  |  real_adapters.py
 
 Nodes never talk to hardware. They only:
   * read/write knowledge objects (messages.py),
   * publish/subscribe events,
-  * call primitives on `screwSegmentation.CORE`.
+  * call primitives on `detection_core.CORE`.
 
 Real rpclpy is imported if available; otherwise the local in-process shim from
 `local_bus.py` is used. `Node`, `timeit_callback` and `run_dashboard` are
@@ -41,7 +41,7 @@ def _try_real_rpclpy():
 
 Node, timeit_callback, run_dashboard, USING_REAL_RPCLPY = _try_real_rpclpy()
 
-import screwSegmentation as ss
+import detection_core as ss
 from messages import (
     FrameRef, Detections, EntropyHistory, RunningAvgEntropy, ActiveModel,
     CandidateModel, InPlanning, ReplanningCounter, LegitResult, ActionCommand,
@@ -122,6 +122,12 @@ class Analysis(Node):
         ]
         det_msg.screw_entropy = float(screw_entropy) if screw_entropy is not None else None
         self.write_knowledge(det_msg)
+
+        # Detections are in the knowledge store - anyone blocked on this cycle
+        # (e.g. the XMLRPC bridge serving the UR pendant) can proceed now.
+        # The entropy/adaptation logic below is MAPLE-K-internal and must not
+        # gate the pendant's synchronous call.
+        self.publish_event(event_key="detection_completed")
 
         # Non-adaptive tasks (topview / screen / fixture) detect and stop here -
         # no entropy window, no anomaly, no model swap.

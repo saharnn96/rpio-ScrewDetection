@@ -1,6 +1,6 @@
 """In-process fallback for the rpclpy `Node` API.
 
-`screwSegmentation_rpio.py` is written against the real rpclpy API
+`maple_k.py` is written against the real rpclpy API
 (`from rpclpy.node import Node`, `publish_event`, `read_knowledge`, ...).
 rpclpy is not installed in this simulation environment and it requires a
 running redis server, so this module provides a drop-in, dependency-free
@@ -16,7 +16,7 @@ Differences from real rpclpy (intentional, for offline simulation):
     real redis it is serialized JSON in a shared db.
 
 To run distributed for real: `pip install rpclpy redis`, start redis, and the
-`try: from rpclpy...` import at the top of screwSegmentation_rpio.py will pick
+`try: from rpclpy...` import at the top of maple_k.py will pick
 up the real library instead of this shim.
 """
 

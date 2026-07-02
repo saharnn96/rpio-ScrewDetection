@@ -11,16 +11,14 @@ needs the extras listed at the bottom of `requirements.txt`.
 
 TODO for the field:
   * Fill in the hardcoded model paths in `RealDetector.MODEL_PATHS`.
-  * Fill in the calibration folder used by the coord-transform helpers if you
-    port them onto the core.
-  * The interfaces here must match those documented in `screwSegmentation.py`.
+  * The interfaces here must match those documented in `detection_core.py`.
 """
 
 import os
 
 import numpy as np
 
-from screwSegmentation import DetectionResult, DetectionClasses
+from detection_core import DetectionResult, DetectionClasses
 
 # Absolute path to this file's directory (repo root). Everything the real
 # adapters load - vendored RDTEReceive config, model weights - is resolved
@@ -57,16 +55,42 @@ class RealCamera:
 
         # Warm-up and exposure lock.
         self.pipeline.wait_for_frames(5000)
-        sensor = self.pipeline.get_active_profile().get_device().query_sensors()[1]
-        sensor.set_option(rs.option.exposure, exposure_us)
+        self._sensor = self.pipeline.get_active_profile().get_device().query_sensors()[1]
+        self._sensor.set_option(rs.option.exposure, exposure_us)
+        self.exposure_us = exposure_us
 
-        self.last_depth_frame = None  # kept for optional coord-transform port
+        self.last_depth_frame = None  # aligned depth of the last color frame
 
     def get_color_image(self):
         frames = self.align.process(self.pipeline.wait_for_frames(5000))
         color = frames.get_color_frame()
         self.last_depth_frame = frames.get_depth_frame()
         return np.asanyarray(color.get_data())
+
+    def get_depth_snapshot(self):
+        """Depth data aligned to the last color frame, in the plain-dict form
+        `detection_core`'s coord-transform helpers consume."""
+        df = self.last_depth_frame
+        if df is None:
+            return None
+        intr = df.profile.as_video_stream_profile().intrinsics
+        return {
+            "depth_image": np.asanyarray(df.get_data()),
+            "fx": intr.fx, "fy": intr.fy,
+            "ppx": intr.ppx, "ppy": intr.ppy,
+            "depth_units": df.get_units(),
+        }
+
+    # --- exposure control (pendant RPC surface) ----------------------------
+    def get_exposure(self):
+        return self.exposure_us
+
+    def set_exposure(self, exposure_us):
+        import time
+        self.exposure_us = exposure_us
+        self._sensor.set_option(self._rs.option.exposure, exposure_us)
+        print(f"Exposure time set to: {exposure_us}")
+        time.sleep(0.2)  # let the camera adjust
 
 
 # ---------------------------------------------------------------------------

@@ -18,5 +18,6 @@ coverage.xml
 htmlcov/
 .idea/
 .vscode/
+.claude
 Thumbs.db
 Desktop.ini

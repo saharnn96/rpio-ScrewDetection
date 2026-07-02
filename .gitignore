@@ -1,5 +1,4 @@
 __pycache__/
-_sim_out/
 *.py[cod]
 *.pyo
 *.pyd
@@ -18,6 +17,5 @@ coverage.xml
 htmlcov/
 .idea/
 .vscode/
-.claude
 Thumbs.db
 Desktop.ini

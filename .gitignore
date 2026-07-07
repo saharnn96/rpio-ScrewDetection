@@ -1,5 +1,7 @@
 __pycache__/
 _sim_out/
+_prod_out/
+xmlrpc_errors.log*
 *.py[cod]
 *.pyo
 *.pyd

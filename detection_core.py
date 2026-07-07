@@ -25,10 +25,13 @@ from collections import namedtuple
 # ---------------------------------------------------------------------------
 # Domain types used by every layer.
 # ---------------------------------------------------------------------------
+# Values are the trained YOLO class ids (same order as the original
+# python/screwSegmentation.py): 0=holder, 1=noscrew, 2=screw. RealDetector
+# passes model labels through unchanged, so these MUST stay in model order.
 class DetectionClasses(enum.Enum):
     HOLDER = 0
-    SCREW = 1
-    NOSCREW = 2
+    NOSCREW = 1
+    SCREW = 2
 
 
 class DetectionModels(enum.Enum):
@@ -41,6 +44,33 @@ class DetectionModels(enum.Enum):
 DetectionResult = namedtuple(
     "DetectionResult", ["label", "box", "score", "mask", "entropy"]
 )
+
+
+def filter_detections_within_holders(detection_results):
+    """Keep holders; keep screw/noscrew detections only when their bbox center
+    lies inside a detected holder. Any other label is dropped.
+
+    Port of the original filter_out_detections_not_within_holders() from
+    python/screwSegmentation.py.
+    """
+    holders = [
+        r for r in detection_results
+        if r.label == DetectionClasses.HOLDER.value and r.box is not None
+    ]
+    filtered = []
+    for result in detection_results:
+        if result.label == DetectionClasses.HOLDER.value:
+            filtered.append(result)
+        elif result.label in (DetectionClasses.SCREW.value,
+                              DetectionClasses.NOSCREW.value):
+            center_x = (result.box[0] + result.box[2]) / 2
+            center_y = (result.box[1] + result.box[3]) / 2
+            for holder in holders:
+                hx1, hy1, hx2, hy2 = holder.box
+                if hx1 <= center_x <= hx2 and hy1 <= center_y <= hy2:
+                    filtered.append(result)
+                    break
+    return filtered
 
 
 # ---------------------------------------------------------------------------

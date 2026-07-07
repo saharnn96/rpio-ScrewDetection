@@ -15,16 +15,27 @@ TODO for the field:
 """
 
 import os
+import sys
 
 import numpy as np
 
-from detection_core import DetectionResult, DetectionClasses
+from detection_core import (
+    DetectionResult, DetectionClasses, filter_detections_within_holders,
+)
 
 # Absolute path to this file's directory (repo root). Everything the real
 # adapters load - vendored RDTEReceive config, model weights - is resolved
 # against this so `real_main.py` works no matter what CWD the UR controller
 # launches it from.
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+# The original code these adapters wrap (the RDTEReceive package and
+# inference_uq_single_detection) lives under screw_detection/python and is
+# written to be imported from that directory - put it on sys.path so the
+# lazy imports below resolve from any CWD.
+_ORIG_PYTHON_DIR = os.path.join(_HERE, "screw_detection", "python")
+if _ORIG_PYTHON_DIR not in sys.path:
+    sys.path.append(_ORIG_PYTHON_DIR)
 _DETECTION_MODEL_DIR = os.path.join(
     _HERE, "screw_detection", "detection_model"
 )
@@ -164,11 +175,15 @@ class RealDetector:
     # Only the closeup task participates in the MAPLE-K entropy swap loop.
     ADAPTIVE_DETECTION_TYPES = {"pc_screen"}
 
+    # The two closeup variants (base + candidate). For these, screws/noscrews
+    # outside a holder are discarded, like the original PC_CLOSEUP path.
+    CLOSEUP_MODEL_IDS = frozenset({1, 2})
+
     # Bbox-detection ids that run through the run_uq / entropy path. The seg
     # model (id 4) is intentionally excluded.
     _BBOX_MODEL_IDS = frozenset(MODEL_PATHS)
 
-    def __init__(self, model_id=1, T=10, uq_config=(0,)):
+    def __init__(self, model_id=1, T=10, uq_config=(0.05,)):
         from ultralytics import YOLO
 
         self.model_id = model_id
@@ -203,7 +218,6 @@ class RealDetector:
                           uq_method="mc_dropout", uq_config=self.uq_config)
 
         results = []
-        screw_entropy = None
         for key, det in uq_preds.items():
             if key == "Metrics_Avg":
                 continue
@@ -212,16 +226,50 @@ class RealDetector:
             if entropy > self.ENTROPY_THRESHOLD:
                 continue  # mirror uq_analysis() filtering
 
-            dr = DetectionResult(
+            results.append(DetectionResult(
                 label=d["label"],
                 box=np.asarray(d["box"], dtype=float),
                 score=float(d["score"]),
                 mask=d.get("mask"),
                 entropy=float(entropy),
-            )
-            results.append(dr)
-            if dr.label in (DetectionClasses.SCREW.value,
-                            DetectionClasses.NOSCREW.value):
-                screw_entropy = dr.entropy
+            ))
+
+        if model_id in self.CLOSEUP_MODEL_IDS:
+            # Closeup task, like the original PC_CLOSEUP path: screws/noscrews
+            # come from the UQ pass, holders from a plain confidence-filtered
+            # pre-pass, and screw/noscrew detections whose center is outside
+            # every holder are discarded.
+            holders = self._detect_holders(image, model_id)
+            results = [r for r in results
+                       if r.label != DetectionClasses.HOLDER.value] + holders
+            results = filter_detections_within_holders(results)
+
+        # Entropy of the surviving screw/noscrew detection (post-filter, so a
+        # stray detection outside the holder can't feed the entropy window).
+        screw_entropy = None
+        for r in results:
+            if r.label in (DetectionClasses.SCREW.value,
+                           DetectionClasses.NOSCREW.value):
+                screw_entropy = r.entropy
 
         return results, screw_entropy
+
+    def _detect_holders(self, image, model_id):
+        """Plain (non-UQ) holder pre-pass: predict at conf 0.75 and keep only
+        HOLDER boxes. Port of the original's holder detection in
+        take_new_image_and_detect()."""
+        preds = self._models[model_id].predict(
+            image, conf=0.75, verbose=False, iou=0.1
+        )
+        holders = []
+        for box in preds[0].boxes:
+            if int(box.cls) != DetectionClasses.HOLDER.value:
+                continue
+            holders.append(DetectionResult(
+                label=DetectionClasses.HOLDER.value,
+                box=box.xyxy[0].cpu().numpy().astype(float),
+                score=float(box.conf[0]),
+                mask=None,
+                entropy=None,
+            ))
+        return holders

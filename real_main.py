@@ -252,6 +252,29 @@ class RobotBridge(Node):
         return None
 
 
+def build_server(bridge, xmlrpc_port=50000, host=""):
+    """Pendant-facing XMLRPC server with the exact method surface the original
+    python/screwSegmentation.py `run()` registered (port 50000)."""
+    server = LoggingXMLRPCServer((host, xmlrpc_port), allow_none=True,
+                                 logRequests=False)
+    server.RequestHandlerClass.protocol_version = "HTTP/1.1"
+    server.register_function(bridge.get_trans_T_cam2gripper, "get_trans_T_cam2gripper")
+
+    server.register_function(bridge.take_new_image_and_detect, "take_new_image_and_detect")
+    server.register_function(bridge.get_detected_object_coords, "get_detected_object_coords")
+
+    server.register_function(bridge.get_exposure_time, "get_exposure_time")
+    server.register_function(bridge.set_exposure_time, "set_exposure_time")
+
+    server.register_function(bridge.enable_show_detections, "enable_show_detections")
+    server.register_function(bridge.disable_show_detections, "disable_show_detections")
+
+    server.register_function(bridge.start_timer, "start_timer")
+    server.register_function(bridge.switch_process, "switch_process")
+    server.register_function(bridge.stop_timer, "stop_timer")
+    return server
+
+
 def main(robot_ip="192.168.1.100", xmlrpc_port=50000,
          calib_folder=DEFAULT_CALIB_FOLDER):
     logging.getLogger().setLevel(logging.INFO)
@@ -297,24 +320,7 @@ def main(robot_ip="192.168.1.100", xmlrpc_port=50000,
     run_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
 
     # --- Serve the pendant -------------------------------------------------
-    server = LoggingXMLRPCServer(("", xmlrpc_port), allow_none=True,
-                                 logRequests=False)
-    server.RequestHandlerClass.protocol_version = "HTTP/1.1"
-    server.register_function(bridge.get_trans_T_cam2gripper, "get_trans_T_cam2gripper")
-
-    server.register_function(bridge.take_new_image_and_detect, "take_new_image_and_detect")
-    server.register_function(bridge.get_detected_object_coords, "get_detected_object_coords")
-
-    server.register_function(bridge.get_exposure_time, "get_exposure_time")
-    server.register_function(bridge.set_exposure_time, "set_exposure_time")
-
-    server.register_function(bridge.enable_show_detections, "enable_show_detections")
-    server.register_function(bridge.disable_show_detections, "disable_show_detections")
-
-    server.register_function(bridge.start_timer, "start_timer")
-    server.register_function(bridge.switch_process, "switch_process")
-    server.register_function(bridge.stop_timer, "stop_timer")
-
+    server = build_server(bridge, xmlrpc_port)
     print(f"Listening on port {xmlrpc_port} ...")
     try:
         server.serve_forever()

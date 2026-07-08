@@ -223,6 +223,7 @@ class Legitimate(Node):
     """LEGITIMATE: re-test the candidate on the last N frames before committing."""
 
     max_replans = DEFAULT_ADAPTATION["max_replans"]
+    entropy_threshold = DEFAULT_ADAPTATION["entropy_threshold"]
 
     def __init__(self, config=None, verbose=True):
         super().__init__(config=config, verbose=verbose)
@@ -247,16 +248,27 @@ class Legitimate(Node):
         result.candidate_avg_entropy = candidate_avg
         result.current_avg_entropy = run_avg.value
 
-        accept = (candidate_avg is not None and run_avg.value is not None
-                  and candidate_avg < run_avg.value)
+        # Relaxed gate: the candidate does not have to strictly beat the
+        # incumbent. It is legit if it improves on the current average OR its
+        # own average is below the anomaly threshold - i.e. deploying it would
+        # clear the anomaly that started this planning cycle.
+        beats_current = (candidate_avg is not None and run_avg.value is not None
+                         and candidate_avg < run_avg.value)
+        clears_threshold = (candidate_avg is not None
+                            and candidate_avg < self.entropy_threshold)
+        accept = beats_current or clears_threshold
 
+        cur = f"{run_avg.value:.3f}" if run_avg.value is not None else "n/a"
         if accept:
             result.is_legit = True
             self.write_knowledge(result)
             replans.count = 0
             self.write_knowledge(replans)
-            self.logger.info("LEGITIMATE: candidate avg %.3f < current %.3f -> ACCEPT",
-                             candidate_avg, run_avg.value)
+            reason = ("beats current avg" if beats_current
+                      else "below anomaly threshold")
+            self.logger.info("LEGITIMATE: candidate avg %.3f (current %s, "
+                             "threshold %.3f) -> ACCEPT (%s)",
+                             candidate_avg, cur, self.entropy_threshold, reason)
             self.publish_event(event_key="plan_validated")
         else:
             result.is_legit = False
@@ -264,10 +276,10 @@ class Legitimate(Node):
             replans.count += 1
             self.write_knowledge(replans)
             ca = f"{candidate_avg:.3f}" if candidate_avg is not None else "n/a"
-            cur = f"{run_avg.value:.3f}" if run_avg.value is not None else "n/a"
             if replans.count <= self.max_replans:
-                self.logger.warning("LEGITIMATE: reject (cand %s >= cur %s) -> re-plan #%d",
-                                    ca, cur, replans.count)
+                self.logger.warning("LEGITIMATE: reject (cand %s >= cur %s and >= "
+                                    "threshold %.3f) -> re-plan #%d",
+                                    ca, cur, self.entropy_threshold, replans.count)
                 self.publish_event(event_key="plan_rejected")
             else:
                 in_planning = self.read_knowledge(InPlanning)

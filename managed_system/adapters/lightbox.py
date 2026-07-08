@@ -167,17 +167,17 @@ class LightboxDetector:
         (list[DetectionResult], screw_entropy: float | None)
     """
 
-    ENTROPY_THRESHOLD = 0.5  # matches original uq_analysis()
+    ENTROPY_THRESHOLD = 0.5  # UQ-path keep filter, matches original uq_analysis()
+    PLAIN_KEEP_ENTROPY = 0.75  # plain-path keep filter (= predict conf 0.25)
 
     # Box model id space (absolute paths, anchored to the repo so they resolve
     # regardless of CWD). Ids 1 & 2 are the two variants the MAPLE-K loop
     # swaps between (ActiveModel.model_id carries these) - on the box these
-    # are the random/leuven weights shipped in lightbox_models/. Ids 3-5 are
-    # the fixed per-task models, selected by detection_type and never touched
-    # by the swap logic.
+    # the weights shipped in lightbox_models/. Ids 3-5 are the fixed per-task
+    # models, selected by detection_type and never touched by the swap logic.
     MODEL_PATHS = {
         1: os.path.join(_LIGHTBOX_MODELS_DIR, "leuven.pt"),
-        2: os.path.join(_LIGHTBOX_MODELS_DIR, "random.pt"),
+        2: os.path.join(_LIGHTBOX_MODELS_DIR, "model2.pt"),
         3: _box_weights("real_images_with_noscrews_and_screw_fixture_extended"),
         5: _box_weights("real_images_with_noscrews_and_screw_fixture"),
         # id 4 (screen segmentation) uses a seg model + a different detect path;
@@ -201,8 +201,22 @@ class LightboxDetector:
     ADAPTIVE_DETECTION_TYPES = {"pc_screen"}
 
     # The two closeup variants (base + candidate). For these, screws/noscrews
-    # outside a holder are discarded, like the original PC_CLOSEUP path.
+    # outside a holder are discarded, like the original PC_CLOSEUP path -
+    # but only if the model actually has a holder class (the box models
+    # don't; see CLASS_NAME_MAP).
     CLOSEUP_MODEL_IDS = frozenset({1, 2})
+
+    # Model class NAME -> pipeline DetectionClasses value. Each weights file
+    # ships its own class schema (the box models use {0: screw, 1: hole};
+    # the original field models {0: holder, 1: noscrew, 2: screw}), so labels
+    # are translated by name. Unknown names pass through unchanged.
+    CLASS_NAME_MAP = {
+        "holder": DetectionClasses.HOLDER.value,
+        "noscrew": DetectionClasses.NOSCREW.value,
+        "no_screw": DetectionClasses.NOSCREW.value,
+        "hole": DetectionClasses.NOSCREW.value,  # empty hole = missing screw
+        "screw": DetectionClasses.SCREW.value,
+    }
 
     # Bbox-detection ids that run through the run_uq / entropy path. The seg
     # model (id 4) is intentionally excluded.
@@ -213,6 +227,18 @@ class LightboxDetector:
         model_id -> weights path); relative paths are resolved against the
         repo root."""
         from ultralytics import YOLO
+
+        # The MC-dropout UQ path needs torchmetrics/deepluq AND the project's
+        # patched ultralytics (stock ultralytics has no `Results.detection`).
+        # Probe the imports here; the patched-fork check can only happen at
+        # the first detect(), which drops to the plain path if it fails.
+        try:
+            from managed_system.uq import run_uq  # noqa: F401
+            self._uq_available = True
+        except ImportError as exc:
+            self._uq_available = False
+            print(f"NOTE: UQ stack unavailable ({exc}); using plain YOLO "
+                  "detection with pseudo-entropy = 1 - confidence.")
 
         self.model_id = model_id
         self.T = T
@@ -231,10 +257,21 @@ class LightboxDetector:
                 loaded_by_path[path] = m
             self._models[mid] = loaded_by_path[path]
 
-    def detect(self, image, model_id):
-        # Lazy import so this module works without deepluq installed.
-        from managed_system.uq import run_uq
+        # Per-model label translation (see CLASS_NAME_MAP) + whether the
+        # model can do holder gating at all.
+        self._label_maps, self._has_holder = {}, {}
+        for mid, m in self._models.items():
+            names = getattr(m, "names", None) or {}
+            lmap = {int(cid): self.CLASS_NAME_MAP.get(str(n).lower(), int(cid))
+                    for cid, n in names.items()}
+            self._label_maps[mid] = lmap
+            self._has_holder[mid] = (
+                DetectionClasses.HOLDER.value in lmap.values())
 
+    def _map_label(self, model_id, cls_id):
+        return self._label_maps[model_id].get(int(cls_id), int(cls_id))
+
+    def detect(self, image, model_id):
         if model_id not in self._BBOX_MODEL_IDS:
             # Seg model (screen/screen_frame): masks, no UQ, and coordinate
             # extraction via oriented bboxes - none of that is ported onto the
@@ -244,8 +281,55 @@ class LightboxDetector:
                 "path is not ported onto ScrewDetectionCore yet."
             )
 
-        model = self._models[model_id]
-        uq_preds = run_uq(model, image, T=self.T,
+        results = None
+        if self._uq_available:
+            try:
+                results = self._detect_uq(image, model_id)
+            except AttributeError as exc:
+                # Stock ultralytics: run_uq needs `Results.detection` (raw
+                # logits), which only the project's patched fork provides.
+                # Drop to the plain path for the rest of the run.
+                self._uq_available = False
+                print("=" * 70)
+                print(f"WARNING: UQ path unusable "
+                      f"({str(exc).splitlines()[0]})")
+                print("This ultralytics build lacks the patched "
+                      "Results.detection field. Falling back to plain YOLO "
+                      "detection with pseudo-entropy = 1 - confidence.")
+                print("=" * 70)
+        if results is None:
+            results = self._detect_plain(image, model_id)
+
+        if model_id in self.CLOSEUP_MODEL_IDS and self._has_holder[model_id]:
+            # Closeup task, like the original PC_CLOSEUP path: screws/noscrews
+            # come from the UQ pass, holders from a plain confidence-filtered
+            # pre-pass, and screw/noscrew detections whose center is outside
+            # every holder are discarded. Skipped entirely for models without
+            # a holder class (the current box models).
+            holders = self._detect_holders(image, model_id)
+            results = [r for r in results
+                       if r.label != DetectionClasses.HOLDER.value] + holders
+            results = filter_detections_within_holders(results)
+
+        # Entropy over the surviving screw/noscrew detections (post-filter, so
+        # a stray detection outside the holder can't feed the entropy window).
+        # The original closeup scene had exactly ONE screw; the box scene has
+        # many, so average over the survivors - identical to the original
+        # behaviour when a single screw is present, robust when not.
+        entropies = [r.entropy for r in results
+                     if r.label in (DetectionClasses.SCREW.value,
+                                    DetectionClasses.NOSCREW.value)
+                     and r.entropy is not None]
+        screw_entropy = float(np.mean(entropies)) if entropies else None
+
+        return results, screw_entropy
+
+    def _detect_uq(self, image, model_id):
+        """MC-dropout UQ pass (T stochastic predictions + WBF clustering).
+        Needs the patched ultralytics; raises AttributeError on stock."""
+        from managed_system.uq import run_uq
+
+        uq_preds = run_uq(self._models[model_id], image, T=self.T,
                           uq_method="mc_dropout", uq_config=self.uq_config)
 
         results = []
@@ -258,32 +342,40 @@ class LightboxDetector:
                 continue  # mirror uq_analysis() filtering
 
             results.append(DetectionResult(
-                label=d["label"],
+                label=self._map_label(model_id, d["label"]),
                 box=np.asarray(d["box"], dtype=float),
                 score=float(d["score"]),
                 mask=d.get("mask"),
                 entropy=float(entropy),
             ))
+        return results
 
-        if model_id in self.CLOSEUP_MODEL_IDS:
-            # Closeup task, like the original PC_CLOSEUP path: screws/noscrews
-            # come from the UQ pass, holders from a plain confidence-filtered
-            # pre-pass, and screw/noscrew detections whose center is outside
-            # every holder are discarded.
-            holders = self._detect_holders(image, model_id)
-            results = [r for r in results
-                       if r.label != DetectionClasses.HOLDER.value] + holders
-            results = filter_detections_within_holders(results)
+    def _detect_plain(self, image, model_id):
+        """Single plain YOLO pass for stock ultralytics - no MC dropout, no
+        logits. Uncertainty is approximated as pseudo-entropy = 1 - confidence
+        so the entropy filter and the MAPLE-K window keep working on the same
+        [0, ENTROPY_THRESHOLD] scale as the UQ path."""
+        preds = self._models[model_id].predict(image, conf=0.25, verbose=False)
 
-        # Entropy of the surviving screw/noscrew detection (post-filter, so a
-        # stray detection outside the holder can't feed the entropy window).
-        screw_entropy = None
-        for r in results:
-            if r.label in (DetectionClasses.SCREW.value,
-                           DetectionClasses.NOSCREW.value):
-                screw_entropy = r.entropy
-
-        return results, screw_entropy
+        results = []
+        for box in preds[0].boxes:
+            score = float(box.conf[0])
+            entropy = 1.0 - score
+            if entropy > self.PLAIN_KEEP_ENTROPY:
+                continue
+            # NOTE: deliberately looser than the UQ path's ENTROPY_THRESHOLD.
+            # If uncertain detections were dropped at the anomaly threshold
+            # (0.5), the entropy window could never average above it and
+            # MAPLE-K adaptation would be unreachable. Keeping detections up
+            # to 0.75 lets degraded confidence actually show in the window.
+            results.append(DetectionResult(
+                label=self._map_label(model_id, box.cls),
+                box=box.xyxy[0].cpu().numpy().astype(float),
+                score=score,
+                mask=None,
+                entropy=entropy,
+            ))
+        return results
 
     def _detect_holders(self, image, model_id):
         """Plain (non-UQ) holder pre-pass: predict at conf 0.75 and keep only
@@ -294,7 +386,7 @@ class LightboxDetector:
         )
         holders = []
         for box in preds[0].boxes:
-            if int(box.cls) != DetectionClasses.HOLDER.value:
+            if self._map_label(model_id, box.cls) != DetectionClasses.HOLDER.value:
                 continue
             holders.append(DetectionResult(
                 label=DetectionClasses.HOLDER.value,

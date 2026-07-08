@@ -26,7 +26,12 @@
 # value (Analysis: window/threshold, Plan: candidate, Legitimate: budget).
 Adaptation_Config:
   entropy_window_size: 10
-  entropy_threshold: 0.5
+  # Calibrated on the light box (plain-detect pseudo-entropy, many screws):
+  # healthy frames average ~0.19-0.22, degraded lighting >= 0.40. The mean
+  # over surviving detections plateaus just below 0.5 (weak detections drop
+  # out of the average as they fall under the conf floor), so 0.5 was
+  # unreachable; 0.35 separates the two bands cleanly.
+  entropy_threshold: 0.35
   candidate_model_id: 2
   max_replans: 3
 

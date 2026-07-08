@@ -31,9 +31,9 @@ from managed_system.core import (
 _REPO_ROOT = os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 
-# The vendored RDTEReceive package these adapters wrap lives both at the repo
-# root and under screw_detection/python (the original tree); put the latter on
-# sys.path so the lazy import below resolves from any CWD.
+# The vendored RDTEReceive package these adapters wrap lives under
+# screw_detection/python (the original tree); put it on sys.path so the lazy
+# import below resolves from any CWD.
 _ORIG_PYTHON_DIR = os.path.join(_REPO_ROOT, "screw_detection", "python")
 if _ORIG_PYTHON_DIR not in sys.path:
     sys.path.append(_ORIG_PYTHON_DIR)

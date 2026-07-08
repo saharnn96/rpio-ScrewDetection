@@ -1,17 +1,18 @@
-"""Layer 1 (Hardware layer) - REAL adapters for field deployment.
+"""REAL adapters for field deployment (managed system, Layer 1).
 
 These wrap the same libraries the original `python/screwSegmentation.py` uses:
   * pyrealsense2       (color+depth camera stream)
   * RDTEReceive.RTDEReceive  (UR robot telemetry)
-  * ultralytics.YOLO + inference_uq_single_detection.run_uq  (detector + UQ)
+  * ultralytics.YOLO + managed_system.uq.run_uq  (detector + MC-dropout UQ)
 
 All heavy imports are done lazily inside `__init__` / `detect`, so this module
 imports cleanly on a machine that only has the sim libraries. Real deployment
 needs the extras listed at the bottom of `requirements.txt`.
 
 TODO for the field:
-  * Fill in the hardcoded model paths in `RealDetector.MODEL_PATHS`.
-  * The interfaces here must match those documented in `detection_core.py`.
+  * Point `detector.model_paths` in `managed_system/config.yaml` at the
+    robot-local closeup weights (`RealDetector.MODEL_PATHS` holds stand-ins).
+  * The interfaces here must match those documented in `managed_system/core.py`.
 """
 
 import os
@@ -19,25 +20,25 @@ import sys
 
 import numpy as np
 
-from detection_core import (
+from managed_system.core import (
     DetectionResult, DetectionClasses, filter_detections_within_holders,
 )
 
-# Absolute path to this file's directory (repo root). Everything the real
-# adapters load - vendored RDTEReceive config, model weights - is resolved
-# against this so `real_main.py` works no matter what CWD the UR controller
-# launches it from.
-_HERE = os.path.dirname(os.path.abspath(__file__))
+# Repo root (this file lives at managed_system/adapters/real.py). Everything
+# the real adapters load - vendored RDTEReceive config, model weights - is
+# resolved against this so `real_main.py` works no matter what CWD the UR
+# controller launches it from.
+_REPO_ROOT = os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))))
 
-# The original code these adapters wrap (the RDTEReceive package and
-# inference_uq_single_detection) lives under screw_detection/python and is
-# written to be imported from that directory - put it on sys.path so the
-# lazy imports below resolve from any CWD.
-_ORIG_PYTHON_DIR = os.path.join(_HERE, "screw_detection", "python")
+# The vendored RDTEReceive package these adapters wrap lives both at the repo
+# root and under screw_detection/python (the original tree); put the latter on
+# sys.path so the lazy import below resolves from any CWD.
+_ORIG_PYTHON_DIR = os.path.join(_REPO_ROOT, "screw_detection", "python")
 if _ORIG_PYTHON_DIR not in sys.path:
     sys.path.append(_ORIG_PYTHON_DIR)
 _DETECTION_MODEL_DIR = os.path.join(
-    _HERE, "screw_detection", "detection_model"
+    _REPO_ROOT, "screw_detection", "detection_model"
 )
 
 
@@ -119,7 +120,7 @@ class RealRTDE:
         # it to the vendored copy next to this module so it resolves regardless
         # of where the process was launched from.
         if config_file is None:
-            config_file = os.path.join(_HERE, "record_configuration.xml")
+            config_file = os.path.join(_REPO_ROOT, "record_configuration.xml")
 
         self._rtde = RTDEReceive(robot_ip, config_file=config_file)
         self._rtde.connect_to_robot()
@@ -183,17 +184,23 @@ class RealDetector:
     # model (id 4) is intentionally excluded.
     _BBOX_MODEL_IDS = frozenset(MODEL_PATHS)
 
-    def __init__(self, model_id=1, T=10, uq_config=(0.05,)):
+    def __init__(self, model_id=1, T=10, uq_config=(0.05,), model_paths=None):
+        """`model_paths` optionally overrides MODEL_PATHS entries (dict of
+        model_id -> weights path, e.g. from managed_system/config.yaml);
+        relative paths are resolved against the repo root."""
         from ultralytics import YOLO
 
         self.model_id = model_id
         self.T = T
         self.uq_config = list(uq_config)
+        paths = dict(self.MODEL_PATHS)
+        for mid, path in (model_paths or {}).items():
+            paths[int(mid)] = os.path.join(_REPO_ROOT, path)
         self._models = {}
         # Dedup by path: several ids share the same weights file today, so we
         # only load each file once.
         loaded_by_path = {}
-        for mid, path in self.MODEL_PATHS.items():
+        for mid, path in paths.items():
             if path not in loaded_by_path:
                 m = YOLO(path)
                 m.fuse()
@@ -202,7 +209,7 @@ class RealDetector:
 
     def detect(self, image, model_id):
         # Lazy import so this module works without deepluq installed.
-        from inference_uq_single_detection import run_uq
+        from managed_system.uq import run_uq
 
         if model_id not in self._BBOX_MODEL_IDS:
             # Seg model (screen/screen_frame): masks, no UQ, and coordinate

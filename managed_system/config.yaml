@@ -1,0 +1,30 @@
+# ============================================================
+# MANAGED SYSTEM config - deployment/hardware facts for the real setup.
+# Read by real_main.py. Adaptation policy (thresholds, windows, candidate
+# model) does NOT belong here - see managing_system/config.yaml.
+#
+# Relative paths are resolved against the repo root.
+# ============================================================
+
+robot_ip: 192.168.1.100
+xmlrpc_port: 50000
+
+camera:
+  width: 1280
+  height: 720
+  exposure_us: 2500
+
+# CalibData folder holding FinalTransforms/T_cam2gripper_Method_1.npz -
+# same layout the original code used.
+calib_folder: screw_detection/python/camera_robot_calibration/screwdriver_tcp/CalibData
+
+out_dir: ./_prod_out
+
+detector:
+  model_id: 1
+  # Optional: override RealDetector.MODEL_PATHS per model id. The in-code
+  # defaults are stand-ins (fixture weights); point ids 1/2 at the real
+  # closeup weights for the field, e.g.:
+  # model_paths:
+  #   1: screw_detection/detection_model/scripts/runs/detect/<closeup-run>/weights/best.pt
+  #   2: screw_detection/detection_model/scripts/runs/detect/<closeup-run-alt>/weights/best.pt

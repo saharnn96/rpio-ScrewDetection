@@ -1,16 +1,16 @@
-"""Simulation entry point.
+"""Simulation entry point (composition root).
 
-Wires the three layers with SIMULATED adapters and drives the MAPLE-K loop:
+Wires the MANAGED system with SIMULATED adapters to the MANAGING system
+(MAPLE-K nodes) and drives the loop with timed ticks:
 
-    Layer 3   maple_k          <-- the five Nodes
-    Layer 2   detection_core   <-- ScrewDetectionCore
-    Layer 1   sim_adapters     <-- SimulatedCamera / SimulatedRTDE / SimulatedDetector
+    managing_system/   the five MAPLE-K Nodes + adaptation policy
+    managed_system/    ScrewDetectionCore + Simulated{Camera,RTDE,Detector}
 
 Run:    python simulation.py
 
 Nothing here knows about YOLO, RealSense or the UR robot - that's the point
-of the layering. Swap `sim_adapters` for `real_adapters` (see `real_main.py`)
-to get the same MAPLE-K loop against real hardware.
+of the split. Swap the sim adapters for the real ones (see `real_main.py`)
+to run the same MAPLE-K loop against real hardware.
 """
 
 import json
@@ -18,18 +18,22 @@ import logging
 import os
 import time
 
-import detection_core as ss
-from detection_core import ScrewDetectionCore
-from maple_k import Node, build_nodes, run_dashboard, USING_REAL_RPCLPY
-from sim_adapters import SimulatedCamera, SimulatedRTDE, SimulatedDetector
-from messages import ActionCommand
+from managed_system import core as ss
+from managed_system.core import ScrewDetectionCore
+from managed_system.adapters.sim import (
+    SimulatedCamera, SimulatedRTDE, SimulatedDetector,
+)
+from managing_system.nodes import Node, build_nodes, run_dashboard, USING_REAL_RPCLPY
+from managing_system.messages import ActionCommand
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 # ---------------------------------------------------------------------------
 # Fake "sensor" that pumps the loop.
 #
 # In real deployment the UR robot's XMLRPC call plays this role - see
-# `real_main.py` for the bridge. In sim, we just emit sensor_data_received
+# `bridge.py` for the RobotBridge. In sim, we just emit sensor_data_received
 # events on a fixed cadence.
 # ---------------------------------------------------------------------------
 class SensorPublisher(Node):
@@ -43,6 +47,18 @@ class SensorPublisher(Node):
         self.publish_event(event_key="sensor_data_received", message=payload)
 
 
+def _load_managing_config():
+    try:
+        import yaml
+        cfg_path = os.path.join(_HERE, "managing_system", "config.yaml")
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                return yaml.safe_load(f) or {}
+    except Exception as exc:
+        print(f"(managing_system/config.yaml not loaded: {exc})")
+    return {}
+
+
 def main(num_ticks=24, interval=0.05):
     logging.getLogger().setLevel(logging.INFO)
     print("=" * 78)
@@ -50,32 +66,20 @@ def main(num_ticks=24, interval=0.05):
           f"(rpclpy={'REAL' if USING_REAL_RPCLPY else 'local shim'})")
     print("=" * 78)
 
-    # --- Layer 1: simulated adapters --------------------------------------
+    # --- MANAGED system: simulated adapters + core --------------------------
     camera = SimulatedCamera(drift_after=12)
     rtde = SimulatedRTDE()
     detector = SimulatedDetector(model_id=1)
-
-    # --- Layer 2: core + config -------------------------------------------
-    core = ScrewDetectionCore(
-        camera=camera, rtde=rtde, detector=detector,
-        out_dir="./_sim_out", entropy_window_size=8, entropy_threshold=0.5,
-        candidate_model_id=2, max_replans=3,
-    )
+    core = ScrewDetectionCore(camera=camera, rtde=rtde, detector=detector,
+                              out_dir="./_sim_out")
     ss.set_core(core)
 
-    config = {}
-    try:
-        import yaml
-        cfg_path = os.path.join(os.path.dirname(__file__), "config.yaml")
-        if os.path.exists(cfg_path):
-            with open(cfg_path) as f:
-                config = yaml.safe_load(f) or {}
-    except Exception as exc:
-        print(f"(config.yaml not loaded: {exc})")
-
-    # --- Layer 3: MAPLE-K nodes -------------------------------------------
+    # --- MANAGING system: MAPLE-K nodes --------------------------------------
+    config = _load_managing_config()
+    # A short window makes the 24-tick demo trip the adaptation quickly.
+    config.setdefault("Adaptation_Config", {})["entropy_window_size"] = 8
     build_nodes(config)
-    sensor = SensorPublisher(config.get("Monitor_Config") if config else None)
+    sensor = SensorPublisher(config.get("Monitor_Config"))
 
     run_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
 

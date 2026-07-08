@@ -1,14 +1,12 @@
-"""Light-box entry point.
+"""Light-box entry point (composition root).
 
 Same wiring as `simulation.py` / `real_main.py`, but for the educational
 light-box setup: REAL RealSense camera, MOCKED robot, real detector when the
 ML stack is installed.
 
-    Layer 3   maple_k            <-- the five Nodes          (unchanged)
-    Layer 2   detection_core     <-- ScrewDetectionCore      (unchanged)
-    Layer 1   lightbox_adapters  <-- LightboxCamera (real) /
-                                     LightboxRTDE (mock) /
-                                     RealDetector or sim fallback
+    managing_system/   the five MAPLE-K Nodes + adaptation policy
+    managed_system/    ScrewDetectionCore + LightboxCamera (real) /
+                       LightboxRTDE (mock) / RealDetector or sim fallback
 
 Run:    python lightbox_main.py
 
@@ -20,16 +18,18 @@ anomaly -> Plan/Legitimate/Execute swap the active model).
 Ctrl+C stops the loop and releases the camera.
 """
 
-import os
 import logging
+import os
 import time
 
-import detection_core as ss
-from detection_core import ScrewDetectionCore
-from maple_k import build_nodes, run_dashboard, USING_REAL_RPCLPY
-from messages import ActiveModel, RunningAvgEntropy
-from lightbox_adapters import LightboxCamera, LightboxRTDE, build_lightbox_detector
-from simulation import SensorPublisher
+from managed_system import core as ss
+from managed_system.core import ScrewDetectionCore
+from managed_system.adapters.lightbox import (
+    LightboxCamera, LightboxRTDE, build_lightbox_detector,
+)
+from managing_system.nodes import build_nodes, run_dashboard, USING_REAL_RPCLPY
+from managing_system.messages import ActiveModel, RunningAvgEntropy
+from simulation import SensorPublisher, _load_managing_config
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -42,35 +42,22 @@ def main(num_ticks=None, interval=2.0, detection_type="pc_screen"):
           f"(rpclpy={'REAL' if USING_REAL_RPCLPY else 'local shim'})")
     print("=" * 78)
 
-    # --- Layer 1: lightbox adapters ----------------------------------------
+    # --- MANAGED system: lightbox adapters + core ----------------------------
     camera = LightboxCamera(width=1280, height=720, exposure_us=2500)
     rtde = LightboxRTDE()
     detector = build_lightbox_detector(model_id=1)
 
     try:
-        # --- Layer 2: core --------------------------------------------------
-        core = ScrewDetectionCore(
-            camera=camera, rtde=rtde, detector=detector,
-            out_dir="./_lightbox_out",
-            entropy_window_size=8, entropy_threshold=0.5,
-            candidate_model_id=2, max_replans=3,
-        )
+        core = ScrewDetectionCore(camera=camera, rtde=rtde, detector=detector,
+                                  out_dir="./_lightbox_out")
         ss.set_core(core)
 
-        # --- Config ---------------------------------------------------------
-        config = {}
-        try:
-            import yaml
-            cfg_path = os.path.join(_HERE, "config.yaml")
-            if os.path.exists(cfg_path):
-                with open(cfg_path) as f:
-                    config = yaml.safe_load(f) or {}
-        except Exception as exc:
-            print(f"(config.yaml not loaded: {exc})")
-
-        # --- Layer 3: MAPLE-K nodes + tick source ---------------------------
+        # --- MANAGING system: MAPLE-K nodes + tick source --------------------
+        config = _load_managing_config()
+        # A short window reacts fast to hand-driven lighting changes.
+        config.setdefault("Adaptation_Config", {})["entropy_window_size"] = 8
         build_nodes(config)
-        sensor = SensorPublisher(config.get("Monitor_Config") if config else None)
+        sensor = SensorPublisher(config.get("Monitor_Config"))
 
         run_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
 

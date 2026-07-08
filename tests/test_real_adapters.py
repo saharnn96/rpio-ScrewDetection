@@ -1,6 +1,7 @@
 """STEP 5 - REAL adapter (field deployment) checks.
 
-Validates `real_adapters.py` + the deployment prerequisites of `real_main.py`.
+Validates `managed_system/adapters/real.py` + the deployment prerequisites of
+`real_main.py`.
 The configuration/parity checks run on any machine; the hardware checks skip
 cleanly when the camera / robot / ML stack is not present, so on the box the
 same script verifies the real thing:
@@ -12,8 +13,8 @@ same script verifies the real thing:
                                        tables - parity with the original.
     3. check_model_weights_on_disk   : every MODEL_PATHS weight file exists.
     4. check_original_modules_importable : the vendored RDTEReceive package
-                                       and inference_uq_single_detection
-                                       resolve from the repo root.
+                                       and managed_system.uq resolve from
+                                       the repo root.
     5. check_calibration_data        : the hand-eye npz real_main loads by
                                        default is a valid rigid transform.
 
@@ -58,7 +59,7 @@ def _get_real_detector():
     _require_module("ultralytics",
                     "pip install ultralytics torch on the box machine")
     if _detector is None:
-        from real_adapters import RealDetector
+        from managed_system.adapters.real import RealDetector
         _detector = RealDetector(model_id=1, T=3)
     return _detector
 
@@ -66,7 +67,7 @@ def _get_real_detector():
 def _require_uq_stack():
     """detect() needs run_uq, which pulls in torch/deepluq/torchmetrics."""
     try:
-        import inference_uq_single_detection  # noqa: F401
+        import managed_system.uq  # noqa: F401
     except ImportError as exc:
         raise SkipCheck(f"UQ stack unavailable ({exc}) - "
                         "pip install torch torchmetrics deepluq on the box")
@@ -79,7 +80,7 @@ def check_detection_class_order():
     """Label ids MUST stay in the trained models' class order (0=holder,
     1=noscrew, 2=screw) or get_detected_object_coords sends the robot to the
     wrong holes. Guard against the SCREW<->NOSCREW swap regression."""
-    from detection_core import DetectionClasses
+    from managed_system.core import DetectionClasses
     assert DetectionClasses.HOLDER.value == 0
     assert DetectionClasses.NOSCREW.value == 1
     assert DetectionClasses.SCREW.value == 2
@@ -87,7 +88,7 @@ def check_detection_class_order():
 
 def check_detector_static_config():
     """RealDetector settings that must stay in parity with the original."""
-    from real_adapters import RealDetector
+    from managed_system.adapters.real import RealDetector
 
     params = inspect.signature(RealDetector.__init__).parameters
     assert params["uq_config"].default == (0.05,), \
@@ -108,7 +109,7 @@ def check_detector_static_config():
 
 def check_model_weights_on_disk():
     """Every bbox model id must point at an existing weights file."""
-    from real_adapters import RealDetector
+    from managed_system.adapters.real import RealDetector
     missing = [f"id {mid}: {path}"
                for mid, path in RealDetector.MODEL_PATHS.items()
                if not os.path.exists(path)]
@@ -120,16 +121,16 @@ def check_original_modules_importable():
     """RealRTDE and detect() lazily import vendored modules that live under
     screw_detection/python - importing real_adapters must make them resolvable
     from any CWD."""
-    import real_adapters  # noqa: F401  (installs the sys.path entry)
-    for mod in ("RDTEReceive", "inference_uq_single_detection"):
+    import managed_system.adapters.real  # noqa: F401  (installs the sys.path entry)
+    for mod in ("RDTEReceive", "managed_system.uq"):
         assert importlib.util.find_spec(mod) is not None, \
-            f"{mod} not importable - sys.path shim in real_adapters broken?"
+            f"{mod} not importable - sys.path shim in adapters/real.py broken?"
 
 
 def check_calibration_data():
     """The default hand-eye calibration must load and be a rigid transform."""
     from real_main import DEFAULT_CALIB_FOLDER
-    from detection_core import ScrewDetectionCore
+    from managed_system.core import ScrewDetectionCore
 
     path = os.path.join(DEFAULT_CALIB_FOLDER, "FinalTransforms",
                         "T_cam2gripper_Method_1.npz")
@@ -161,7 +162,7 @@ def check_calibration_data():
 def check_real_detector_class_names():
     """The deployed weights' own class names must agree with DetectionClasses.
     This is the definitive label-order guard against the actual model files."""
-    from detection_core import DetectionClasses
+    from managed_system.core import DetectionClasses
     det = _get_real_detector()
 
     for mid in sorted(det.CLOSEUP_MODEL_IDS):
@@ -178,7 +179,7 @@ def check_real_detector_class_names():
 
 def check_real_detector_contract():
     """detect() contract + the inside-holder filter postcondition."""
-    from detection_core import DetectionResult, DetectionClasses
+    from managed_system.core import DetectionResult, DetectionClasses
     det = _get_real_detector()
     _require_uq_stack()
 
@@ -222,7 +223,7 @@ def check_real_camera():
     """RealCamera color + aligned depth snapshot + exposure roundtrip."""
     _require_module("pyrealsense2",
                     "pip install pyrealsense2 on the box machine")
-    from real_adapters import RealCamera
+    from managed_system.adapters.real import RealCamera
     try:
         cam = RealCamera(width=1280, height=720, exposure_us=2500)
     except Exception as exc:
@@ -257,7 +258,7 @@ def check_real_rtde():
         raise SkipCheck(f"no robot reachable at {ROBOT_IP}:{RTDE_PORT} ({exc}) "
                         "- set ROBOT_IP or connect the UR robot")
 
-    from real_adapters import RealRTDE
+    from managed_system.adapters.real import RealRTDE
     rtde = RealRTDE(robot_ip=ROBOT_IP)
     pose = rtde.get_tcp_pose()
     assert set(pose) == {"x", "y", "z", "rx", "ry", "rz"}, f"bad pose: {pose}"

@@ -4,7 +4,7 @@ The light box has a REAL RealSense camera but NO robot yet, so this module
 mixes one real adapter with one mock:
 
   * LightboxCamera  - the real pyrealsense2 pipeline (reuses RealCamera from
-                      `real_adapters.py` unchanged) plus a `close()` helper so
+                      `real.py` unchanged) plus a `close()` helper so
                       test scripts can release the device.
   * LightboxRTDE    - mocked robot telemetry. Same interface as RealRTDE
                       (`get_tcp_pose()`), returns a fixed-but-settable pose.
@@ -21,7 +21,7 @@ mixes one real adapter with one mock:
 Wire-up entry point: `lightbox_main.py`. Test scripts: `tests/`.
 """
 
-from real_adapters import RealCamera
+from managed_system.adapters.real import RealCamera
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ def build_lightbox_detector(model_id=1, allow_sim_fallback=True, **real_kwargs):
     MC-dropout passes during testing).
     """
     try:
-        from real_adapters import RealDetector
+        from managed_system.adapters.real import RealDetector
         return RealDetector(model_id=model_id, **real_kwargs)
     except Exception as exc:
         if not allow_sim_fallback:
@@ -97,5 +97,5 @@ def build_lightbox_detector(model_id=1, allow_sim_fallback=True, **real_kwargs):
         print("For real detection on the box: pip install ultralytics torch "
               "torchmetrics deepluq")
         print("=" * 70)
-        from sim_adapters import SimulatedDetector
+        from managed_system.adapters.sim import SimulatedDetector
         return SimulatedDetector(model_id=model_id)

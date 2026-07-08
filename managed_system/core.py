@@ -1,18 +1,21 @@
-"""Layer 2 (Application layer) - hardware-agnostic screw-detection primitives.
+"""MANAGED SYSTEM core - hardware-agnostic screw-detection primitives.
 
-(Formerly named `screwSegmentation.py`; renamed to `detection_core.py` to
-avoid clashing with the original `screw_detection/python/screwSegmentation.py`.)
+`ScrewDetectionCore` is the managed system's application layer AND its
+touchpoint surface for the managing system (MAPLE-K, `managing_system/`):
 
-This is the application layer of the three-layer architecture:
+    PROBES     capture(), detect(), append_rolling_image(),
+               list_rolling_images(), log_knowledge()
+    EFFECTORS  swap_model()
 
-    Layer 3 (MAPLE-K nodes)   -->  maple_k.py
-    Layer 2 (this file)       -->  ScrewDetectionCore + adapter INTERFACES
-    Layer 1 (adapters)        -->  sim_adapters.py  |  real_adapters.py
+The managing system calls ONLY these methods (via the CORE singleton injected
+with set_core() at the composition root). Everything below them is internal:
+hardware access is funnelled through the injected adapters
+(`managed_system/adapters/`: sim | real | lightbox) that satisfy the
+interfaces documented below. Nothing in this package knows MAPLE-K exists.
 
-Nothing here talks to hardware directly. Every camera/robot/model call is
-funnelled through an injected adapter that satisfies the interfaces documented
-below. Layer 3 talks to this file only. Adapters are chosen by whichever entry
-point wires the core (`simulation.py` or `real_main.py`).
+Adaptation POLICY (entropy threshold, window size, candidate model, replan
+budget) deliberately does NOT live here - it belongs to the managing system
+(`managing_system/config.yaml`, Adaptation_Config).
 """
 
 import enum
@@ -107,8 +110,7 @@ class ScrewDetectionCore:
     """
 
     def __init__(self, camera, rtde, detector, out_dir="./_sim_out",
-                 entropy_window_size=10, entropy_threshold=0.5,
-                 candidate_model_id=2, max_replans=3, calib_folder=None):
+                 calib_folder=None):
         self.camera = camera
         self.rtde = rtde
         self.detector = detector
@@ -118,11 +120,6 @@ class ScrewDetectionCore:
         self.capture_dir = os.path.join(out_dir, "real_time_detection_images")
         os.makedirs(self.rolling_dir, exist_ok=True)
         os.makedirs(self.capture_dir, exist_ok=True)
-
-        self.entropy_window_size = entropy_window_size
-        self.entropy_threshold = entropy_threshold
-        self.candidate_model_id = candidate_model_id
-        self.max_replans = max_replans
 
         self.knowledge_log_path = os.path.join(out_dir, "knowledge_log.csv")
 
@@ -212,13 +209,19 @@ class ScrewDetectionCore:
         image = cv2.imread(frame_path)
         return self.detector.detect(image, model_id)
 
-    def append_rolling_image(self, frame_path):
-        """Keep only the last `entropy_window_size` frames in the rolling dir."""
+    def append_rolling_image(self, frame_path, window):
+        """Keep only the newest `window` frames in the rolling dir. The window
+        size is managing-system policy, so the caller passes it in."""
         dst = os.path.join(self.rolling_dir, os.path.basename(frame_path))
         shutil.copyfile(frame_path, dst)
         images = sorted(os.listdir(self.rolling_dir))
-        while len(images) > self.entropy_window_size:
+        while len(images) > window:
             os.remove(os.path.join(self.rolling_dir, images.pop(0)))
+
+    # --- EXECUTE effector ---------------------------------------------------
+    def swap_model(self, model_id):
+        """EFFECTOR: deploy a different detection model (called by Execute)."""
+        self.detector.model_id = model_id
 
     def list_rolling_images(self):
         return [
@@ -360,11 +363,13 @@ class ScrewDetectionCore:
 # ---------------------------------------------------------------------------
 # Shared-instance singleton.
 #
-# The entry point (simulation.py or real_main.py) builds the core with the
-# adapters it wants and calls set_core(core) once. Every MAPLE-K node then
-# reads it via `detection_core.CORE`. Nodes must NOT `from detection_core
-# import CORE` (that binds the name at import time when CORE is still None) -
-# they must reference the module attribute so it sees the value set later.
+# The composition root (simulation.py / real_main.py / lightbox_main.py)
+# builds the core with the adapters it wants and calls set_core(core) once.
+# Every MAPLE-K node then reads it via `managed_system.core.CORE`. Nodes must
+# NOT `from managed_system.core import CORE` (that binds the name at import
+# time when CORE is still None) - they must reference the module attribute
+# (`from managed_system import core as ss; ss.CORE`) so it sees the value set
+# later.
 # ---------------------------------------------------------------------------
 CORE: "ScrewDetectionCore | None" = None
 

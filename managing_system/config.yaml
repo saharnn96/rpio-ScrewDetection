@@ -1,9 +1,13 @@
 # ============================================================
-# MAPLE-K Config for the screw-detection simulation
+# MANAGING SYSTEM config - MAPLE-K node wiring + adaptation policy.
 #
 # Event flow:
-#   sensor_data_received (from Sensor)  --> Monitor    --> observation_recorded
-#   observation_recorded                --> Analysis   --> anomaly_detected
+#   sensor_data_received (Sensor tick or RobotBridge RPC)
+#                                       --> Monitor    --> observation_recorded
+#   observation_recorded                --> Analysis   --> detection_completed
+#                                                          (every cycle; unblocks
+#                                                          the RobotBridge)
+#                                                      --> anomaly_detected
 #   anomaly_detected                    --> Plan       --> plan_generated
 #   plan_generated                      --> Legitimate --> plan_validated  (accept)
 #                                                       --> plan_rejected  (re-plan loop)
@@ -13,7 +17,18 @@
 # The offline `local_bus` shim ignores redis / topics / QoS and dispatches
 # in-process. Those fields are kept so this file works unchanged with real
 # rpclpy + redis.
+#
+# Managed-system deployment facts (robot IP, ports, model paths, camera) live
+# in managed_system/config.yaml, NOT here.
 # ============================================================
+
+# Adaptation policy - applied by build_nodes() onto the nodes that use each
+# value (Analysis: window/threshold, Plan: candidate, Legitimate: budget).
+Adaptation_Config:
+  entropy_window_size: 10
+  entropy_threshold: 0.5
+  candidate_model_id: 2
+  max_replans: 3
 
 Monitor_Config:
   Logger_Config:
@@ -117,6 +132,12 @@ Analysis_Config:
           QoS: 10
   eventOut:
     properties:
+      - property:
+          type: event
+          name: detection_completed
+          class: "-"
+          topic: /detection_completed
+          QoS: 10
       - property:
           type: event
           name: anomaly_detected
@@ -326,6 +347,73 @@ Execute_Config:
           name: plan_executed
           class: "-"
           topic: /plan_executed
+          QoS: 10
+  Event_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Message_Manager_Config:
+    protocol: redis
+    host: localhost
+    port: 6379
+  Knowledge_Config:
+    knowledge_type: redis
+    host: localhost
+    port: 6379
+    db: 0
+
+# The UR-pendant XML-RPC bridge (bridge.py) - only wired by real_main.py.
+# It injects sensor_data_received into the loop, waits for
+# detection_completed, and serves coords from Detections/FrameRef knowledge.
+RobotBridge_Config:
+  Logger_Config:
+    log_level: INFO
+    logger_type: terminal
+    format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    terminal: {}
+    file:
+      filename: MAPLE.log
+    redis:
+      host: localhost
+      port: 6379
+      channel: RobotBridge:logs
+  knowledgeIn:
+    properties:
+      - property:
+          type: data
+          name: Detections
+          class: Detections
+          topic: /detections
+          QoS: 10
+      - property:
+          type: data
+          name: FrameRef
+          class: FrameRef
+          topic: /frame_ref
+          QoS: 10
+  knowledgeOut:
+    properties:
+      - property:
+          type: data
+          name: Detections
+          class: Detections
+          topic: /detections
+          QoS: 10
+  eventIn:
+    properties:
+      - property:
+          type: event
+          name: detection_completed
+          class: "-"
+          topic: /detection_completed
+          QoS: 10
+  eventOut:
+    properties:
+      - property:
+          type: event
+          name: sensor_data_received
+          class: "-"
+          topic: /sensor_data_received
           QoS: 10
   Event_Manager_Config:
     protocol: redis

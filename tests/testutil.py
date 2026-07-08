@@ -81,7 +81,7 @@ def get_camera():
                          "run `pip install pyrealsense2` on the box machine")
         raise SkipCheck(_camera_error)
 
-    from lightbox_adapters import LightboxCamera
+    from managed_system.adapters.lightbox import LightboxCamera
     try:
         _camera = LightboxCamera(width=1280, height=720, exposure_us=2500)
     except Exception as exc:
@@ -101,9 +101,8 @@ def close_camera():
 def reset_bus():
     """Fresh in-process event bus + knowledge store (needed between MAPLE-K
     wirings, since nodes register callbacks on a module-level singleton)."""
-    import maple_k
-    if maple_k.USING_REAL_RPCLPY:
+    from managing_system import nodes, local_bus
+    if nodes.USING_REAL_RPCLPY:
         raise SkipCheck("real rpclpy/redis bus is active; these loop tests "
                         "need the in-process shim - stop redis and re-run")
-    import local_bus
     local_bus.BUS = local_bus._Bus()

@@ -19,8 +19,8 @@ import numpy as np
 
 from testutil import SkipCheck, run_checks, get_camera, close_camera, REPO_ROOT
 
-from detection_core import DetectionResult
-from lightbox_adapters import LightboxRTDE, build_lightbox_detector
+from managed_system.core import DetectionResult
+from managed_system.adapters.lightbox import LightboxRTDE, build_lightbox_detector
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "lightbox_snapshot.jpg")
@@ -107,7 +107,7 @@ def check_camera_exposure_roundtrip():
 # ---------------------------------------------------------------------------
 def check_detector_contract():
     detector = build_lightbox_detector(model_id=1, T=3)
-    from sim_adapters import SimulatedDetector
+    from managed_system.adapters.sim import SimulatedDetector
     if isinstance(detector, SimulatedDetector):
         print("    NOTE: using SimulatedDetector fallback (install "
               "ultralytics/torch/deepluq on the box for real detection)")

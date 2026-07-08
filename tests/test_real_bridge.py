@@ -1,7 +1,7 @@
-"""STEP 4 - real_main.py pendant contract (XML-RPC bridge) checks.
+"""STEP 4 - pendant contract (XML-RPC bridge) checks.
 
-Exercises the exact production wiring of `real_main.py` - RobotBridge +
-LoggingXMLRPCServer built by `build_server()` - over a REAL XML-RPC
+Exercises the exact production wiring of `bridge.py` (used by `real_main.py`)
+- RobotBridge + LoggingXMLRPCServer built by `build_server()` - over a REAL XML-RPC
 client connection, the same way the UR pendant calls it. Only the hardware
 adapters are replaced (scripted camera/detector, sim RTDE), so these checks
 run on any machine:
@@ -35,9 +35,9 @@ import numpy as np
 
 from testutil import SkipCheck, run_checks, reset_bus
 
-import detection_core as ss
-from detection_core import ScrewDetectionCore, DetectionResult, DetectionClasses
-from sim_adapters import SimulatedRTDE
+from managed_system import core as ss
+from managed_system.core import ScrewDetectionCore, DetectionResult, DetectionClasses
+from managed_system.adapters.sim import SimulatedRTDE
 
 # The synchronous UR pendant surface (original screwSegmentation.py, port 50000).
 EXPECTED_RPC_SURFACE = {
@@ -143,15 +143,13 @@ def _get_ctx():
         return _ctx
     reset_bus()  # raises SkipCheck when a real rpclpy/redis bus is active
 
-    from maple_k import build_nodes
-    from real_main import RobotBridge, build_server, _configure_rpc_logger
+    from managing_system.nodes import build_nodes
+    from bridge import RobotBridge, build_server
 
     detector = ScriptedBridgeDetector()
     core = ScrewDetectionCore(
         camera=ScriptedCamera(), rtde=SimulatedRTDE(), detector=detector,
         out_dir=tempfile.mkdtemp(prefix="real_bridge_test_"),
-        entropy_window_size=10, entropy_threshold=0.5,
-        candidate_model_id=2, max_replans=3,
         calib_folder=_identity_calib_folder(),
     )
     ss.set_core(core)
@@ -161,7 +159,6 @@ def _get_ctx():
     bridge.register_callbacks()
     bridge.start()
 
-    _configure_rpc_logger()
     server = build_server(bridge, xmlrpc_port=0, host="127.0.0.1")
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -196,7 +193,7 @@ def rpc_surface_matches_original():
 
 def rpc_take_and_detect():
     """take_new_image_and_detect completes a MAPLE-K cycle and returns None."""
-    from messages import FrameRef, Detections
+    from managing_system.messages import FrameRef, Detections
     ctx = _get_ctx()
     ctx["detector"].mode = "objects"
 
@@ -269,7 +266,7 @@ def rpc_aux_surface():
 def rpc_fault_correlation():
     """Errors become Faults with a correlation id that is in the log file,
     and the server keeps serving afterwards."""
-    from real_main import _RPC_LOG_FILENAME
+    from bridge import _RPC_LOG_FILENAME
     ctx = _get_ctx()
     client = ctx["client"]
 

@@ -1,15 +1,14 @@
-"""Layer 3 (MAPLE-K loop) - the five rpclpy nodes.
+"""MANAGING SYSTEM - the five MAPLE-K rpclpy nodes.
 
-This is the TOP layer of the three-layer architecture:
-
-    Layer 3 (this file)       -->  Monitor / Analysis / Plan / Legitimate / Execute
-    Layer 2 (application)     -->  detection_core.ScrewDetectionCore
-    Layer 1 (adapters)        -->  sim_adapters.py  |  real_adapters.py
-
-Nodes never talk to hardware. They only:
+Monitor / Analysis / Plan / Legitimate / Execute adapt the managed system
+(`managed_system/`). Nodes never talk to hardware. They only:
   * read/write knowledge objects (messages.py),
   * publish/subscribe events,
-  * call primitives on `detection_core.CORE`.
+  * call the probe/effector methods on `managed_system.core.CORE`.
+
+Adaptation POLICY (entropy threshold, window size, candidate model, replan
+budget) lives in `managing_system/config.yaml` under `Adaptation_Config`;
+`build_nodes()` applies it on top of the DEFAULT_ADAPTATION class attributes.
 
 Real rpclpy is imported if available; otherwise the local in-process shim from
 `local_bus.py` is used. `Node`, `timeit_callback` and `run_dashboard` are
@@ -36,16 +35,27 @@ def _try_real_rpclpy():
                      socket_connect_timeout=0.5).ping()
         return _Node, _tc, _rd, True
     except Exception:
-        from local_bus import Node as _Node, timeit_callback as _tc, run_dashboard as _rd
+        from managing_system.local_bus import (
+            Node as _Node, timeit_callback as _tc, run_dashboard as _rd,
+        )
         return _Node, _tc, _rd, False
 
 Node, timeit_callback, run_dashboard, USING_REAL_RPCLPY = _try_real_rpclpy()
 
-import detection_core as ss
-from messages import (
+from managed_system import core as ss
+from managing_system.messages import (
     FrameRef, Detections, EntropyHistory, RunningAvgEntropy, ActiveModel,
     CandidateModel, InPlanning, ReplanningCounter, LegitResult, ActionCommand,
 )
+
+# Adaptation policy defaults; overridden per deployment by the
+# `Adaptation_Config` section of managing_system/config.yaml (see build_nodes).
+DEFAULT_ADAPTATION = {
+    "entropy_window_size": 10,
+    "entropy_threshold": 0.5,
+    "candidate_model_id": 2,
+    "max_replans": 3,
+}
 
 
 # ===========================================================================
@@ -95,6 +105,9 @@ class Monitor(Node):
 class Analysis(Node):
     """ANALYZE: run UQ, update the entropy window, flag anomalies."""
 
+    entropy_window_size = DEFAULT_ADAPTATION["entropy_window_size"]
+    entropy_threshold = DEFAULT_ADAPTATION["entropy_threshold"]
+
     def __init__(self, config=None, verbose=True):
         super().__init__(config=config, verbose=verbose)
         self._name = "Analysis"
@@ -142,7 +155,7 @@ class Analysis(Node):
 
         hist = self.read_knowledge(EntropyHistory)
         hist.values.append(screw_entropy)
-        if len(hist.values) > ss.CORE.entropy_window_size:
+        if len(hist.values) > self.entropy_window_size:
             hist.values.pop(0)
         self.write_knowledge(hist)
 
@@ -151,17 +164,17 @@ class Analysis(Node):
         run_avg.value = avg
         self.write_knowledge(run_avg)
 
-        ss.CORE.append_rolling_image(frame_ref.frame_path)
+        ss.CORE.append_rolling_image(frame_ref.frame_path, self.entropy_window_size)
         self.logger.info("ANALYZE: screw_entropy=%.3f  running_avg=%.3f (window=%d)",
                          screw_entropy, avg, len(hist.values))
 
         in_planning = self.read_knowledge(InPlanning)
-        if (avg > ss.CORE.entropy_threshold and not in_planning.in_planning
-                and len(hist.values) >= ss.CORE.entropy_window_size):
+        if (avg > self.entropy_threshold and not in_planning.in_planning
+                and len(hist.values) >= self.entropy_window_size):
             in_planning.in_planning = True
             self.write_knowledge(in_planning)
             self.logger.warning("ANALYZE: anomaly! avg %.3f > threshold %.3f -> trigger Plan",
-                                avg, ss.CORE.entropy_threshold)
+                                avg, self.entropy_threshold)
             self.publish_event(event_key="anomaly_detected")
 
     def register_callbacks(self):
@@ -174,6 +187,9 @@ class Analysis(Node):
 class Plan(Node):
     """PLAN: propose a different model / light configuration."""
 
+    entropy_threshold = DEFAULT_ADAPTATION["entropy_threshold"]
+    candidate_model_id = DEFAULT_ADAPTATION["candidate_model_id"]
+
     def __init__(self, config=None, verbose=True):
         super().__init__(config=config, verbose=verbose)
         self._name = "Plan"
@@ -185,8 +201,8 @@ class Plan(Node):
         replans = self.read_knowledge(ReplanningCounter)
 
         candidate = CandidateModel()
-        candidate.model_id = ss.CORE.candidate_model_id
-        candidate.reason = (f"running_avg entropy exceeded {ss.CORE.entropy_threshold}; "
+        candidate.model_id = self.candidate_model_id
+        candidate.reason = (f"running_avg entropy exceeded {self.entropy_threshold}; "
                             f"swap from model {active.model_id} "
                             f"(replan #{replans.count})")
         self.write_knowledge(candidate)
@@ -205,6 +221,8 @@ class Plan(Node):
 # ===========================================================================
 class Legitimate(Node):
     """LEGITIMATE: re-test the candidate on the last N frames before committing."""
+
+    max_replans = DEFAULT_ADAPTATION["max_replans"]
 
     def __init__(self, config=None, verbose=True):
         super().__init__(config=config, verbose=verbose)
@@ -247,7 +265,7 @@ class Legitimate(Node):
             self.write_knowledge(replans)
             ca = f"{candidate_avg:.3f}" if candidate_avg is not None else "n/a"
             cur = f"{run_avg.value:.3f}" if run_avg.value is not None else "n/a"
-            if replans.count <= ss.CORE.max_replans:
+            if replans.count <= self.max_replans:
                 self.logger.warning("LEGITIMATE: reject (cand %s >= cur %s) -> re-plan #%d",
                                     ca, cur, replans.count)
                 self.publish_event(event_key="plan_rejected")
@@ -256,7 +274,7 @@ class Legitimate(Node):
                 in_planning.in_planning = False
                 self.write_knowledge(in_planning)
                 self.logger.error("LEGITIMATE: reject and max replans (%d) reached -> abort",
-                                  ss.CORE.max_replans)
+                                  self.max_replans)
 
     def register_callbacks(self):
         self.register_event_callback(event_key="plan_generated", callback=self.legitimizer)
@@ -279,8 +297,8 @@ class Execute(Node):
         if not result or not result.is_legit:
             return
 
-        # Apply the swap.
-        ss.CORE.detector.model_id = result.candidate_model_id
+        # Apply the swap through the managed system's effector.
+        ss.CORE.swap_model(result.candidate_model_id)
         active = ActiveModel()
         active.model_id = result.candidate_model_id
         self.write_knowledge(active)
@@ -318,12 +336,27 @@ class Execute(Node):
 # Wiring helper - used by both simulation.py and real_main.py.
 # ===========================================================================
 def build_nodes(config):
-    """Instantiate, register and start all five MAPLE-K nodes."""
+    """Instantiate, register and start all five MAPLE-K nodes.
+
+    `config` is the managing-system config (managing_system/config.yaml):
+    per-node sections plus the `Adaptation_Config` policy block, which is
+    applied over DEFAULT_ADAPTATION onto the nodes that use each value.
+    """
+    config = config if isinstance(config, dict) else {}
+    adaptation = {**DEFAULT_ADAPTATION, **(config.get("Adaptation_Config") or {})}
+    unknown = set(adaptation) - set(DEFAULT_ADAPTATION)
+    if unknown:
+        raise ValueError(f"Unknown Adaptation_Config keys: {sorted(unknown)}; "
+                         f"valid: {sorted(DEFAULT_ADAPTATION)}")
+
     nodes = []
     for cls, key in [(Monitor, "Monitor_Config"), (Analysis, "Analysis_Config"),
                      (Plan, "Plan_Config"), (Legitimate, "Legitimate_Config"),
                      (Execute, "Execute_Config")]:
-        node = cls(config.get(key) if isinstance(config, dict) else None)
+        node = cls(config.get(key))
+        for param in DEFAULT_ADAPTATION:
+            if hasattr(type(node), param):
+                setattr(node, param, adaptation[param])
         node.register_callbacks()
         node.start()
         nodes.append(node)

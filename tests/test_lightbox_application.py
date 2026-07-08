@@ -20,9 +20,8 @@ import numpy as np
 
 from testutil import SkipCheck, run_checks, get_camera, close_camera
 
-import detection_core
-from detection_core import ScrewDetectionCore, DetectionClasses
-from lightbox_adapters import LightboxRTDE, build_lightbox_detector
+from managed_system.core import ScrewDetectionCore, DetectionClasses
+from managed_system.adapters.lightbox import LightboxRTDE, build_lightbox_detector
 
 OUT_DIR = tempfile.mkdtemp(prefix="lightbox_app_test_")
 WINDOW = 4
@@ -41,8 +40,7 @@ def _get_detector():
 def _build_core(camera=None):
     return ScrewDetectionCore(
         camera=camera, rtde=LightboxRTDE(), detector=_get_detector(),
-        out_dir=OUT_DIR, entropy_window_size=WINDOW,
-        entropy_threshold=0.5, candidate_model_id=2, max_replans=3,
+        out_dir=OUT_DIR,
     )
 
 
@@ -87,11 +85,11 @@ def check_core_detect():
 
 
 def check_rolling_window():
-    """Entropy window: only the newest `entropy_window_size` frames are kept."""
+    """Entropy window: only the newest `window` frames are kept."""
     core = _build_core(camera=None)
     for i in range(WINDOW + 3):
         core.append_rolling_image(
-            _synthetic_jpg(os.path.join(OUT_DIR, f"roll_{i:02d}.jpg")))
+            _synthetic_jpg(os.path.join(OUT_DIR, f"roll_{i:02d}.jpg")), WINDOW)
 
     rolling = core.list_rolling_images()
     assert len(rolling) == WINDOW, f"expected {WINDOW} rolling images, got {len(rolling)}"

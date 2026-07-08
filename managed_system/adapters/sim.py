@@ -1,13 +1,13 @@
-"""Layer 1 (Hardware layer) - SIMULATED adapters.
+"""SIMULATED adapters (managed system, Layer 1).
 
-Each class satisfies the adapter interface documented in `detection_core.py`.
-Nothing in Layer 2 or Layer 3 cares whether it is a sim or a real adapter -
-`simulation.py` picks these; `real_main.py` picks the ones in `real_adapters.py`.
+Each class satisfies the adapter interface documented in `managed_system/core.py`.
+Nothing above Layer 1 cares whether it is a sim or a real adapter -
+`simulation.py` picks these; `real_main.py` picks the ones in `real.py`.
 """
 
 import numpy as np
 
-from detection_core import DetectionResult, DetectionClasses
+from managed_system.core import DetectionResult, DetectionClasses
 
 
 # ---------------------------------------------------------------------------

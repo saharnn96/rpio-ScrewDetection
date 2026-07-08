@@ -25,10 +25,10 @@ import numpy as np
 
 from testutil import SkipCheck, run_checks, get_camera, close_camera, reset_bus
 
-import detection_core as ss
-from detection_core import ScrewDetectionCore, DetectionResult, DetectionClasses
-from lightbox_adapters import LightboxRTDE, build_lightbox_detector
-from messages import (
+from managed_system import core as ss
+from managed_system.core import ScrewDetectionCore, DetectionResult, DetectionClasses
+from managed_system.adapters.lightbox import LightboxRTDE, build_lightbox_detector
+from managing_system.messages import (
     FrameRef, Detections, EntropyHistory, ActiveModel, ActionCommand,
     InPlanning, ReplanningCounter, LegitResult,
 )
@@ -69,7 +69,7 @@ def _loop_camera(require_real):
             raise
         print("    NOTE: no RealSense found - using SimulatedCamera for this "
               "plumbing check; re-run on the box for the real thing")
-        from sim_adapters import SimulatedCamera
+        from managed_system.adapters.sim import SimulatedCamera
         return SimulatedCamera(), False
 
 
@@ -79,14 +79,16 @@ def _wire(camera, detector, window, max_replans=3):
     core = ScrewDetectionCore(
         camera=camera, rtde=LightboxRTDE(), detector=detector,
         out_dir=tempfile.mkdtemp(prefix="lightbox_maplek_test_"),
-        entropy_window_size=window, entropy_threshold=0.5,
-        candidate_model_id=2, max_replans=max_replans,
     )
     ss.set_core(core)
 
-    from maple_k import build_nodes
+    from managing_system.nodes import build_nodes
     from simulation import SensorPublisher
-    build_nodes({})
+    # Adaptation policy now belongs to the managing system's config.
+    build_nodes({"Adaptation_Config": {
+        "entropy_window_size": window, "entropy_threshold": 0.5,
+        "candidate_model_id": 2, "max_replans": max_replans,
+    }})
     return SensorPublisher()
 
 
@@ -96,7 +98,7 @@ def _tick(sensor, detection_type="pc_screen"):
 
 
 def _count_events(event_key, counter):
-    import local_bus
+    from managing_system import local_bus
     local_bus.BUS.subscribe(event_key, lambda msg: counter.append(event_key))
 
 

@@ -13,6 +13,7 @@ Checks that need hardware that isn't present are reported as [SKIP], not
 
 import os
 import sys
+import time
 import traceback
 
 # Make the repo root importable no matter where the script is launched from.
@@ -98,11 +99,86 @@ def close_camera():
         _camera = None
 
 
-def reset_bus():
-    """Fresh in-process event bus + knowledge store (needed between MAPLE-K
-    wirings, since nodes register callbacks on a module-level singleton)."""
-    from managing_system import nodes, local_bus
-    if nodes.USING_REAL_RPCLPY:
-        raise SkipCheck("real rpclpy/redis bus is active; these loop tests "
-                        "need the in-process shim - stop redis and re-run")
-    local_bus.BUS = local_bus._Bus()
+# ---------------------------------------------------------------------------
+# Real rpclpy/redis bus helpers. The MAPLE-K nodes dispatch events on redis
+# pub/sub listener threads, so tests must (a) start from a clean knowledge
+# store, (b) wait for events instead of assuming synchronous dispatch, and
+# (c) shut old node wirings down so their subscribers stop firing.
+# 127.0.0.1, never "localhost": the IPv6 fallback stalls ~21s per connection.
+# ---------------------------------------------------------------------------
+REDIS_HOST, REDIS_PORT = "127.0.0.1", 6379
+
+
+def get_redis():
+    """Connected redis client, or raise SkipCheck when no server is running."""
+    import redis
+    client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT,
+                         socket_connect_timeout=1, decode_responses=True)
+    try:
+        client.ping()
+    except Exception as exc:
+        raise SkipCheck(f"redis not reachable on {REDIS_HOST}:{REDIS_PORT} "
+                        f"({type(exc).__name__}) - start redis and re-run")
+    return client
+
+
+def flush_redis():
+    """Wipe the knowledge store/logs so a wiring starts from clean state."""
+    get_redis().flushdb()
+
+
+def wait_until(predicate, timeout=15.0, interval=0.05):
+    """Poll `predicate` until truthy or timeout; returns the last result."""
+    deadline = time.time() + timeout
+    result = predicate()
+    while not result and time.time() < deadline:
+        time.sleep(interval)
+        result = predicate()
+    return result
+
+
+class EventCounter:
+    """Counts bus events per key via a redis pub/sub listener thread."""
+
+    def __init__(self, *event_keys):
+        self.events = {key: [] for key in event_keys}
+        self._pubsub = get_redis().pubsub(ignore_subscribe_messages=True)
+        self._pubsub.subscribe(**{
+            key: (lambda msg, key=key: self.events[key].append(msg["data"]))
+            for key in event_keys
+        })
+        self._thread = self._pubsub.run_in_thread(sleep_time=0.01, daemon=True)
+
+    def count(self, event_key):
+        return len(self.events[event_key])
+
+    def wait_for(self, event_key, count=1, timeout=15.0):
+        """True once `event_key` has fired at least `count` times."""
+        return bool(wait_until(lambda: self.count(event_key) >= count,
+                               timeout=timeout))
+
+    def close(self):
+        # Stop and JOIN the worker before closing the pubsub socket -
+        # closing first makes the poll loop die with socket errors.
+        self._thread.stop()
+        self._thread.join(timeout=2)
+        self._pubsub.close()
+
+
+_live_nodes = []
+
+
+def track_nodes(nodes):
+    """Remember started rpclpy nodes so the next wiring can shut them down."""
+    _live_nodes.extend(nodes)
+
+
+def shutdown_nodes():
+    """Stop all tracked nodes' pub/sub listeners (old wirings must not keep
+    reacting to events meant for the current one)."""
+    while _live_nodes:
+        node = _live_nodes.pop()
+        try:
+            node.shutdown()
+        except Exception:
+            pass

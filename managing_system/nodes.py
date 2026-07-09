@@ -10,43 +10,77 @@ Adaptation POLICY (entropy threshold, window size, candidate model, replan
 budget) lives in `managing_system/config.yaml` under `Adaptation_Config`;
 `build_nodes()` applies it on top of the DEFAULT_ADAPTATION class attributes.
 
-Real rpclpy is imported if available; otherwise the local in-process shim from
-`local_bus.py` is used. `Node`, `timeit_callback` and `run_dashboard` are
-re-exported so downstream files (`simulation.py`, `real_main.py`) never have
-to repeat the try/except.
+`Node`, `timeit_callback` and `run_dashboard` are re-exported so downstream
+files (`simulation.py`, `real_main.py`) import them from here. rpclpy requires
+a reachable redis server (127.0.0.1:6379 - see config.yaml; never use
+"localhost", which stalls ~21s per connection on Windows).
 """
 
+import functools
+import logging
 import os
+import threading
 import time
 
-# --- rpclpy with offline fallback (imported once, re-exported for others) ---
-# We only commit to the real rpclpy if BOTH the package imports AND a redis
-# server is actually reachable, since rpclpy hard-depends on redis and crashes
-# at the first knowledge write otherwise. Falling back cleanly means
-# `python simulation.py` works with zero setup even if rpclpy happens to be
-# installed on the machine.
-def _try_real_rpclpy():
-    try:
-        from rpclpy.node import Node as _Node
-        from rpclpy.utils import timeit_callback as _tc
-        from rpclpy.DashboardApp import run_dashboard as _rd
-        import redis as _redis
-        _redis.Redis(host="localhost", port=6379,
-                     socket_connect_timeout=0.5).ping()
-        return _Node, _tc, _rd, True
-    except Exception:
-        from managing_system.local_bus import (
-            Node as _Node, timeit_callback as _tc, run_dashboard as _rd,
-        )
-        return _Node, _tc, _rd, False
+# The dashboard reads REDIS_HOST at import time, defaulting to "localhost" -
+# which Windows resolves to ::1 first and stalls ~21s per connection when
+# redis only listens on IPv4. Pin it before the import (config.yaml uses
+# 127.0.0.1 for the same reason).
+os.environ.setdefault("REDIS_HOST", "127.0.0.1")
 
-Node, timeit_callback, run_dashboard, USING_REAL_RPCLPY = _try_real_rpclpy()
+from rpclpy.node import Node
+from rpclpy.utils import timeit_callback
+from rpclpy.DashboardApp import run_dashboard
+
+
+def start_dashboard(**kwargs):
+    """Run the rpclpy dashboard without blocking.
+
+    `run_dashboard` calls Dash's `app.run()`, which serves Flask on the
+    calling thread forever - entry points must not call it before their main
+    loop. This wrapper puts it on a daemon thread instead.
+
+    It also keeps the terminal reserved for MAPLE-K logs: werkzeug would log
+    every 1-2s browser poll, and the dashboard's own logger would propagate
+    to the root handler (it still ships to redis for the Logs panel).
+    """
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    logging.getLogger("dashboard").propagate = False
+    logging.getLogger("dash.dash").setLevel(logging.ERROR)
+    # Flask print()s its "* Serving Flask app ..." banner outside the logging
+    # system; blanking the banner hook is the only way to keep it off the
+    # terminal. (Do NOT fake WERKZEUG_RUN_MAIN instead - werkzeug then expects
+    # an inherited reloader socket and crashes.)
+    import flask.cli
+    flask.cli.show_server_banner = lambda *args, **kwargs: None
+    t = threading.Thread(target=run_dashboard, kwargs=kwargs,
+                         name="Dashboard", daemon=True)
+    t.start()
+    return t
 
 from managed_system import core as ss
 from managing_system.messages import (
     FrameRef, Detections, EntropyHistory, RunningAvgEntropy, ActiveModel,
     CandidateModel, InPlanning, ReplanningCounter, LegitResult, ActionCommand,
 )
+
+def safe_callback(fn):
+    """Keep a node alive when its event callback raises.
+
+    rpclpy dispatches events on the node's redis listener thread; an uncaught
+    exception unwinds that thread's listen loop and the node silently stops
+    receiving events forever. Log the failure and keep listening instead.
+    """
+    @functools.wraps(fn)
+    def wrapper(self, msg):
+        try:
+            return fn(self, msg)
+        except Exception:
+            self.logger.exception(
+                "%s.%s failed on this event; node keeps listening",
+                type(self).__name__, fn.__name__)
+    return wrapper
+
 
 # Adaptation policy defaults; overridden per deployment by the
 # `Adaptation_Config` section of managing_system/config.yaml (see build_nodes).
@@ -76,6 +110,7 @@ class Monitor(Node):
         self.write_knowledge(ReplanningCounter())
 
     @timeit_callback
+    @safe_callback
     def monitor(self, msg):
         import json
         data = json.loads(msg) if isinstance(msg, str) else (msg or {})
@@ -114,6 +149,7 @@ class Analysis(Node):
         self.logger.info("Analysis instantiated")
 
     @timeit_callback
+    @safe_callback
     def analysis(self, msg):
         frame_ref = self.read_knowledge(FrameRef)
         active = self.read_knowledge(ActiveModel)
@@ -196,6 +232,7 @@ class Plan(Node):
         self.logger.info("Plan instantiated")
 
     @timeit_callback
+    @safe_callback
     def planner(self, msg):
         active = self.read_knowledge(ActiveModel)
         replans = self.read_knowledge(ReplanningCounter)
@@ -231,6 +268,7 @@ class Legitimate(Node):
         self.logger.info("Legitimate instantiated")
 
     @timeit_callback
+    @safe_callback
     def legitimizer(self, msg):
         candidate = self.read_knowledge(CandidateModel)
         run_avg = self.read_knowledge(RunningAvgEntropy)
@@ -304,6 +342,7 @@ class Execute(Node):
         self.logger.info("Execute instantiated")
 
     @timeit_callback
+    @safe_callback
     def executer(self, msg):
         result = self.read_knowledge(LegitResult)
         if not result or not result.is_legit:

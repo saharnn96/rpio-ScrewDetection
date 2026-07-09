@@ -14,9 +14,8 @@
 #   plan_rejected                       --> Plan       --> plan_generated
 #   plan_validated                      --> Execute    --> plan_executed
 #
-# The offline `local_bus` shim ignores redis / topics / QoS and dispatches
-# in-process. Those fields are kept so this file works unchanged with real
-# rpclpy + redis.
+# All hosts are 127.0.0.1 on purpose: "localhost" resolves to ::1 first on
+# Windows and stalls ~21s per connection when redis only listens on IPv4.
 #
 # Managed-system deployment facts (robot IP, ports, model paths, camera) live
 # in managed_system/config.yaml, NOT here.
@@ -38,13 +37,13 @@ Adaptation_Config:
 Monitor_Config:
   Logger_Config:
     log_level: INFO
-    logger_type: terminal
+    logger_type: redis
     format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     terminal: {}
     file:
       filename: MAPLE.log
     redis:
-      host: localhost
+      host: 127.0.0.1
       port: 6379
       channel: Monitor:logs
   knowledgeIn:
@@ -75,28 +74,28 @@ Monitor_Config:
           QoS: 10
   Event_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Message_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Knowledge_Config:
     knowledge_type: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
     db: 0
 
 Analysis_Config:
   Logger_Config:
     log_level: INFO
-    logger_type: terminal
+    logger_type: redis
     format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     terminal: {}
     file:
       filename: MAPLE.log
     redis:
-      host: localhost
+      host: 127.0.0.1
       port: 6379
       channel: Analysis:logs
   knowledgeIn:
@@ -151,28 +150,28 @@ Analysis_Config:
           QoS: 10
   Event_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Message_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Knowledge_Config:
     knowledge_type: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
     db: 0
 
 Plan_Config:
   Logger_Config:
     log_level: INFO
-    logger_type: terminal
+    logger_type: redis
     format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     terminal: {}
     file:
       filename: MAPLE.log
     redis:
-      host: localhost
+      host: 127.0.0.1
       port: 6379
       channel: Plan:logs
   knowledgeIn:
@@ -221,28 +220,28 @@ Plan_Config:
           QoS: 10
   Event_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Message_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Knowledge_Config:
     knowledge_type: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
     db: 0
 
 Legitimate_Config:
   Logger_Config:
     log_level: INFO
-    logger_type: terminal
+    logger_type: redis
     format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     terminal: {}
     file:
       filename: MAPLE.log
     redis:
-      host: localhost
+      host: 127.0.0.1
       port: 6379
       channel: Legitimate:logs
   knowledgeIn:
@@ -291,28 +290,28 @@ Legitimate_Config:
           QoS: 10
   Event_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Message_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Knowledge_Config:
     knowledge_type: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
     db: 0
 
 Execute_Config:
   Logger_Config:
     log_level: INFO
-    logger_type: terminal
+    logger_type: redis
     format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     terminal: {}
     file:
       filename: MAPLE.log
     redis:
-      host: localhost
+      host: 127.0.0.1
       port: 6379
       channel: Execute:logs
   knowledgeIn:
@@ -355,15 +354,15 @@ Execute_Config:
           QoS: 10
   Event_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Message_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Knowledge_Config:
     knowledge_type: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
     db: 0
 
@@ -373,13 +372,13 @@ Execute_Config:
 RobotBridge_Config:
   Logger_Config:
     log_level: INFO
-    logger_type: terminal
+    logger_type: redis
     format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     terminal: {}
     file:
       filename: MAPLE.log
     redis:
-      host: localhost
+      host: 127.0.0.1
       port: 6379
       channel: RobotBridge:logs
   knowledgeIn:
@@ -422,14 +421,14 @@ RobotBridge_Config:
           QoS: 10
   Event_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Message_Manager_Config:
     protocol: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
   Knowledge_Config:
     knowledge_type: redis
-    host: localhost
+    host: 127.0.0.1
     port: 6379
     db: 0

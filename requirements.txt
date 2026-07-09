@@ -1,4 +1,4 @@
-# Minimum runtime dependencies for the offline MAPLE-K screw-detection simulation.
+# Minimum runtime dependencies for the MAPLE-K screw-detection simulation.
 #
 # Install with:
 #   pip install -r requirements.txt
@@ -12,14 +12,13 @@ numpy>=1.20
 opencv-python>=4.5
 PyYAML>=5.4
 
-# ---------------------------------------------------------------------------
-# Optional - only needed to run the same nodes against a real distributed bus
-# instead of the in-process `local_bus` shim. When these are installed AND a
-# redis server is reachable, `screwSegmentation_rpio.py` imports rpclpy
-# automatically and the sim behaves as a real distributed MAPLE-K deployment.
-# ---------------------------------------------------------------------------
-# rpclpy
-# redis>=4.0
+# Distributed MAPLE-K bus - managing_system/nodes.py imports rpclpy directly.
+# A redis server must be reachable on localhost:6379 at runtime.
+# rpclpy does not declare dash/plotly itself, but its DashboardApp
+# (run_dashboard) imports them, so we pin dash here (plotly comes with it).
+rpclpy>=1.0.1
+redis>=4.0
+dash>=2.0
 
 # ---------------------------------------------------------------------------
 # Not needed for the simulation - listed here for the real-hardware port only:

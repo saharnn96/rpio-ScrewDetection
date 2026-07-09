@@ -10,9 +10,6 @@ Contract (from reading `rpclpy/node.py` for real deployment):
     on-disk path (FrameRef.frame_path).
   * Real rpclpy also stamps `uid` and `timestamp` onto each written instance;
     we don't declare them because they are populated at write time.
-
-The offline `local_bus.py` shim also keys by `cls.name`, so the same message
-definitions work identically in both modes.
 """
 
 

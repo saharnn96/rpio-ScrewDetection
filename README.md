@@ -21,7 +21,7 @@ reference and is not modified.
    │  The five rpclpy Nodes: Monitor, Analysis, Plan,     │  nodes.py
    │  Legitimate, Execute. Knowledge classes (the K).     │  messages.py
    │  Adaptation policy (thresholds, window, candidate).  │  config.yaml
-   │  In-process bus shim when rpclpy/redis is absent.    │  local_bus.py
+   │  Events/knowledge ride on rpclpy + redis (127.0.0.1).│
    └───────────────┬───────────────────▲──────────────────┘
                    │ probes: capture(), detect(),
                    │         append_rolling_image(), log_knowledge()
@@ -59,9 +59,8 @@ Pendant call failing → `bridge.py` (grep `xmlrpc_errors.log` for the
 
 | File | System | Role |
 |---|---|---|
-| `managing_system/nodes.py` | managing | The five `Node` subclasses + `build_nodes(config)` + `DEFAULT_ADAPTATION`. Re-exports `Node`, `timeit_callback`, `run_dashboard` from real rpclpy if available. |
+| `managing_system/nodes.py` | managing | The five `Node` subclasses + `build_nodes(config)` + `DEFAULT_ADAPTATION`. Re-exports `Node`, `timeit_callback`, `run_dashboard` from rpclpy and adds the non-blocking `start_dashboard()`. |
 | `managing_system/messages.py` | managing | Plain-attribute knowledge classes (`FrameRef`, `Detections`, `EntropyHistory`, `RunningAvgEntropy`, `ActiveModel`, `CandidateModel`, `InPlanning`, `ReplanningCounter`, `LegitResult`, `ActionCommand`). Image data never goes through here — only file paths. |
-| `managing_system/local_bus.py` | managing | Fallback for `rpclpy.node.Node` when rpclpy/redis is not available. In-process, synchronous. Picked automatically. |
 | `managing_system/config.yaml` | managing | Node wiring (events/knowledge/topics/redis) + `Adaptation_Config` (entropy threshold, window size, candidate model id, replan budget) + `RobotBridge_Config`. |
 | `managed_system/core.py` | managed | `ScrewDetectionCore`: probe/effector surface, detection primitives, image-point→base-frame coordinate transforms, `CORE` singleton set by the composition root. Domain types (`DetectionResult`, `DetectionClasses`). |
 | `managed_system/adapters/sim.py` | managed | `SimulatedCamera` / `SimulatedRTDE` / `SimulatedDetector`. Zero hardware deps. |
@@ -106,8 +105,7 @@ Change the box lighting by hand mid-run to trigger the adaptation.
 2. Point `detector.model_paths` in `managed_system/config.yaml` at your real
    closeup `.pt` files (the in-code defaults are fixture-weight stand-ins).
 3. Check `robot_ip` / `xmlrpc_port` in `managed_system/config.yaml`.
-4. Optionally `pip install rpclpy redis` and start a redis server if you
-   want the nodes distributed instead of in-process.
+4. Start a redis server on 127.0.0.1:6379 (the MAPLE-K nodes require it).
 5. `python real_main.py` — then run the URScript program on the pendant.
 
 ### Tests
@@ -173,13 +171,13 @@ Two properties fall out of this and matter for the trust check:
   strictly lower entropy than model 1 on the same frames, so
   `candidate_avg < current_avg` and the swap is accepted.
 
-### 4. rpclpy — `managing_system/local_bus.py` (replaces the distributed bus)
-Not hardware, but same idea: an interface swap. `local_bus.Node` provides
-`write_knowledge` / `read_knowledge` / `publish_event` /
-`register_event_callback` / `start` with identical signatures. Publish is
-synchronous (one `sensor_data_received` emit drives the whole chain on one
-stack). `managing_system/nodes.py` imports real rpclpy if present (and a
-redis server is reachable), this shim otherwise.
+### 4. The bus — rpclpy + redis (no offline shim)
+The MAPLE-K nodes run on the real distributed bus in every mode, simulation
+included: events and knowledge go through rpclpy over a redis server on
+127.0.0.1:6379 (`127.0.0.1`, not `localhost` - the IPv6 fallback stalls ~21s
+per connection on Windows). Event dispatch is asynchronous on pub/sub
+listener threads, which is why the loop tests wait for events instead of
+assuming one `sensor_data_received` emit runs the whole chain inline.
 
 ---
 
@@ -223,5 +221,4 @@ Interesting compared to the original: `Plan.planner` and the model-swap in
 | 1 | Point ids 1/2 at the real closeup weights (in-code defaults are fixture stand-ins) | `managed_system/config.yaml` |
 | 2 | Segmentation model (screen/screen_frame obj_types) not ported — those pendant calls raise a Fault | `managed_system/adapters/real.py`, `core.py` |
 | 3 | Brightness-variant closeup models + auto-exposure from the original are not ported | `managed_system/adapters/real.py` |
-| 4 | (Optional) `pip install rpclpy redis` + start redis for distributed nodes | none |
-| 5 | (Optional) smarter Plan policy with more than one candidate model | `managing_system/nodes.py` |
+| 4 | (Optional) smarter Plan policy with more than one candidate model | `managing_system/nodes.py` |

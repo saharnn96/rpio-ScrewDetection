@@ -150,10 +150,12 @@ class RobotBridge(Node):
         self._done.clear()
         # Clear last cycle's detections so a failed cycle can't serve stale coords.
         self.write_knowledge(Detections())
-        payload = json.dumps({
+        # rpclpy stamps uid/timestamp into the message, so it must be a dict;
+        # it does the JSON serialization itself.
+        payload = {
             "detection_type": detection_type_string,
             "tcp_pose": tcp_pose,
-        })
+        }
         self.publish_event(event_key="sensor_data_received", message=payload)
         if not self._done.wait(timeout=self.CYCLE_TIMEOUT_S):
             raise TimeoutError(

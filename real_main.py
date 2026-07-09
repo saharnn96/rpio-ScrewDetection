@@ -20,7 +20,7 @@ import os
 
 from managed_system import core as dc
 from managed_system.core import ScrewDetectionCore
-from managing_system.nodes import build_nodes, run_dashboard, USING_REAL_RPCLPY
+from managing_system.nodes import build_nodes, start_dashboard
 from bridge import RobotBridge, build_server
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -47,8 +47,7 @@ def _load_yaml(path):
 def main():
     logging.getLogger().setLevel(logging.INFO)
     print("=" * 78)
-    print(f"Screw-detection MAPLE-K (real hardware)  "
-          f"(rpclpy={'REAL' if USING_REAL_RPCLPY else 'local shim'})")
+    print("Screw-detection MAPLE-K (real hardware)  (rpclpy + redis)")
     print("=" * 78)
 
     managed_cfg = _load_yaml(os.path.join(_HERE, "managed_system", "config.yaml"))
@@ -81,7 +80,7 @@ def main():
     bridge.register_callbacks()
     bridge.start()
 
-    run_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
+    start_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
 
     # --- Serve the pendant ---------------------------------------------------
     xmlrpc_port = managed_cfg.get("xmlrpc_port", 50000)

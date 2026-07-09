@@ -27,7 +27,7 @@ from managed_system.core import ScrewDetectionCore
 from managed_system.adapters.lightbox import (
     LightboxCamera, LightboxRTDE, build_lightbox_detector,
 )
-from managing_system.nodes import build_nodes, run_dashboard, USING_REAL_RPCLPY
+from managing_system.nodes import build_nodes, start_dashboard
 from managing_system.messages import ActiveModel, RunningAvgEntropy
 from simulation import SensorPublisher, _load_managing_config
 
@@ -36,10 +36,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 def main(num_ticks=None, interval=2.0, detection_type="pc_screen"):
     """`num_ticks=None` runs until Ctrl+C."""
-    logging.getLogger().setLevel(logging.INFO)
+    # Node loggers ship to redis for the dashboard (config.yaml logger_type);
+    # a root handler keeps them visible on the terminal too via propagation.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     print("=" * 78)
-    print(f"Screw-detection MAPLE-K light-box run  "
-          f"(rpclpy={'REAL' if USING_REAL_RPCLPY else 'local shim'})")
+    print("Screw-detection MAPLE-K light-box run  (rpclpy + redis)")
     print("=" * 78)
 
     # --- MANAGED system: lightbox adapters + core ----------------------------
@@ -58,8 +61,9 @@ def main(num_ticks=None, interval=2.0, detection_type="pc_screen"):
         config.setdefault("Adaptation_Config", {})["entropy_window_size"] = 8
         build_nodes(config)
         sensor = SensorPublisher(config.get("Monitor_Config"))
+        sensor.start()
 
-        run_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
+        start_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
 
         print("\nPumping sensor_data_received ticks from the light box.")
         print("Tip: change the box lighting mid-run to trigger the MAPLE-K "

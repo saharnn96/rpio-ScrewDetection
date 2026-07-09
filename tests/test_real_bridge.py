@@ -22,7 +22,7 @@ run on any machine:
      the previous cycle's coordinates.
 
 Run anywhere:   python tests/test_real_bridge.py
-(Needs the in-process bus shim; skips if a real rpclpy/redis bus is active.)
+(Needs a redis server on 127.0.0.1:6379 for the rpclpy bus; skips without it.)
 """
 
 import os
@@ -33,7 +33,7 @@ import xmlrpc.client
 
 import numpy as np
 
-from testutil import SkipCheck, run_checks, reset_bus
+from testutil import SkipCheck, run_checks, flush_redis, track_nodes, shutdown_nodes
 
 from managed_system import core as ss
 from managed_system.core import ScrewDetectionCore, DetectionResult, DetectionClasses
@@ -141,9 +141,10 @@ def _get_ctx():
     global _ctx
     if _ctx is not None:
         return _ctx
-    reset_bus()  # raises SkipCheck when a real rpclpy/redis bus is active
+    flush_redis()  # raises SkipCheck when no redis server is reachable
 
     from managing_system.nodes import build_nodes
+    from simulation import _load_managing_config
     from bridge import RobotBridge, build_server
 
     detector = ScriptedBridgeDetector()
@@ -154,10 +155,16 @@ def _get_ctx():
     )
     ss.set_core(core)
 
-    build_nodes({})
-    bridge = RobotBridge(None)
+    # Real rpclpy nodes need the full per-node wiring config from config.yaml.
+    config = _load_managing_config()
+    track_nodes(build_nodes(config))
+    bridge = RobotBridge(config.get("RobotBridge_Config"))
+    # A failed cycle only surfaces to the pendant as a timeout (see
+    # rpc_fault_correlation); keep that wait short. Healthy cycles take <1s.
+    bridge.CYCLE_TIMEOUT_S = 10
     bridge.register_callbacks()
     bridge.start()
+    track_nodes([bridge])
 
     server = build_server(bridge, xmlrpc_port=0, host="127.0.0.1")
     port = server.server_address[1]
@@ -178,6 +185,7 @@ def _shutdown():
         _ctx["client"]("close")()
         _ctx["server"].shutdown()
         _ctx["server"].server_close()
+    shutdown_nodes()
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +295,14 @@ def rpc_fault_correlation():
                  "[rpc:", "NotImplementedError")
 
     # A failure deep inside the MAPLE-K cycle must also surface as a Fault
-    # (not a hang) - the pendant's call is synchronous.
+    # (not a hang forever). On the real async bus the exception cannot travel
+    # back to the pendant's synchronous call: it is logged by the Analysis
+    # node (which must survive it - see nodes.safe_callback) and the bridge
+    # times the cycle out.
     ctx["detector"].mode = "boom"
     expect_fault(
         lambda: client.take_new_image_and_detect(POSE_ZERO, "pc_screen"),
-        "[rpc:", "boom")
+        "[rpc:", "TimeoutError")
     ctx["detector"].mode = "objects"
 
     # The correlation id from the Fault must be greppable in the log file.

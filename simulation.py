@@ -23,7 +23,7 @@ from managed_system.core import ScrewDetectionCore
 from managed_system.adapters.sim import (
     SimulatedCamera, SimulatedRTDE, SimulatedDetector,
 )
-from managing_system.nodes import Node, build_nodes, run_dashboard, USING_REAL_RPCLPY
+from managing_system.nodes import Node, build_nodes, start_dashboard
 from managing_system.messages import ActionCommand
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,8 +42,9 @@ class SensorPublisher(Node):
         self._name = "Sensor"
 
     def emit(self, detection_type, tcp_pose):
-        payload = json.dumps({"detection_type": detection_type,
-                              "tcp_pose": tcp_pose})
+        # rpclpy stamps uid/timestamp into the message, so it must be a dict;
+        # it does the JSON serialization itself.
+        payload = {"detection_type": detection_type, "tcp_pose": tcp_pose}
         self.publish_event(event_key="sensor_data_received", message=payload)
 
 
@@ -60,10 +61,13 @@ def _load_managing_config():
 
 
 def main(num_ticks=24, interval=0.05):
-    logging.getLogger().setLevel(logging.INFO)
+    # Node loggers ship to redis for the dashboard (config.yaml logger_type);
+    # a root handler keeps them visible on the terminal too via propagation.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     print("=" * 78)
-    print(f"Screw-detection MAPLE-K simulation  "
-          f"(rpclpy={'REAL' if USING_REAL_RPCLPY else 'local shim'})")
+    print("Screw-detection MAPLE-K simulation  (rpclpy + redis)")
     print("=" * 78)
 
     # --- MANAGED system: simulated adapters + core --------------------------
@@ -80,8 +84,9 @@ def main(num_ticks=24, interval=0.05):
     config.setdefault("Adaptation_Config", {})["entropy_window_size"] = 8
     build_nodes(config)
     sensor = SensorPublisher(config.get("Monitor_Config"))
+    sensor.start()
 
-    run_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
+    start_dashboard(host="127.0.0.1", port=8050, debug=False, start_trust=True)
 
     print("\nDriving sensor_data_received ticks (lighting goes dim at tick 12)...\n")
     for tick in range(num_ticks):

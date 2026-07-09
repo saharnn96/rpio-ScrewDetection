@@ -1,7 +1,8 @@
 """STEP 3 - Full MAPLE-K loop checks on the light box.
 
 Wires all three layers exactly like `lightbox_main.py` (real camera, mocked
-robot) and drives `sensor_data_received` ticks through the in-process bus:
+robot) and drives `sensor_data_received` ticks through the real rpclpy/redis
+bus (a redis server on 127.0.0.1:6379 is required; checks skip without it):
 
   1. loop_smoke_real_stack : the real light-box stack (camera + detector as
      installed) completes Monitor -> Analysis cycles and writes knowledge.
@@ -23,7 +24,10 @@ import tempfile
 
 import numpy as np
 
-from testutil import SkipCheck, run_checks, get_camera, close_camera, reset_bus
+from testutil import (
+    SkipCheck, run_checks, get_camera, close_camera,
+    EventCounter, flush_redis, shutdown_nodes, track_nodes, wait_until,
+)
 
 from managed_system import core as ss
 from managed_system.core import ScrewDetectionCore, DetectionResult, DetectionClasses
@@ -74,8 +78,10 @@ def _loop_camera(require_real):
 
 
 def _wire(camera, detector, window, max_replans=3):
-    """Fresh bus + core + the five MAPLE-K nodes; returns a sensor node."""
-    reset_bus()
+    """Fresh knowledge store + core + the five MAPLE-K nodes on the real
+    redis bus; returns a started sensor node."""
+    shutdown_nodes()  # previous wiring's subscribers must stop firing
+    flush_redis()
     core = ScrewDetectionCore(
         camera=camera, rtde=LightboxRTDE(), detector=detector,
         out_dir=tempfile.mkdtemp(prefix="lightbox_maplek_test_"),
@@ -83,23 +89,27 @@ def _wire(camera, detector, window, max_replans=3):
     ss.set_core(core)
 
     from managing_system.nodes import build_nodes
-    from simulation import SensorPublisher
-    # Adaptation policy now belongs to the managing system's config.
-    build_nodes({"Adaptation_Config": {
+    from simulation import SensorPublisher, _load_managing_config
+    # Real rpclpy nodes need the full per-node wiring config; only the
+    # adaptation policy is overridden per test.
+    config = _load_managing_config()
+    config["Adaptation_Config"] = {
         "entropy_window_size": window, "entropy_threshold": 0.5,
         "candidate_model_id": 2, "max_replans": max_replans,
-    }})
-    return SensorPublisher()
+    }
+    track_nodes(build_nodes(config))
+    sensor = SensorPublisher(config.get("Monitor_Config"))
+    sensor.start()
+    track_nodes([sensor])
+    return sensor
 
 
-def _tick(sensor, detection_type="pc_screen"):
+def _tick(sensor, counter, tick_no, detection_type="pc_screen"):
+    """Emit one sensor event and wait for its Monitor->Analysis cycle."""
     sensor.emit(detection_type=detection_type,
                 tcp_pose=ss.CORE.rtde.get_tcp_pose())
-
-
-def _count_events(event_key, counter):
-    from managing_system import local_bus
-    local_bus.BUS.subscribe(event_key, lambda msg: counter.append(event_key))
+    assert counter.wait_for("detection_completed", count=tick_no + 1), \
+        f"tick {tick_no}: detection_completed did not arrive"
 
 
 # ---------------------------------------------------------------------------
@@ -109,15 +119,16 @@ def loop_smoke_real_stack():
     detector = build_lightbox_detector(model_id=1, T=3)
     sensor = _wire(camera, detector, window=8)
 
-    completed = []
-    _count_events("detection_completed", completed)
+    counter = EventCounter("detection_completed")
 
     num_ticks = 3
-    for _ in range(num_ticks):
-        _tick(sensor)
+    for i in range(num_ticks):
+        _tick(sensor, counter, i)
 
-    assert len(completed) == num_ticks, \
-        f"expected {num_ticks} detection_completed events, got {len(completed)}"
+    completed = counter.count("detection_completed")
+    counter.close()
+    assert completed == num_ticks, \
+        f"expected {num_ticks} detection_completed events, got {completed}"
 
     frame_ref = sensor.read_knowledge(FrameRef)
     assert frame_ref is not None and os.path.exists(frame_ref.frame_path), \
@@ -149,13 +160,14 @@ def loop_forced_model_swap():
     detector = ScriptedDetector({1: 0.9, 2: 0.1}, model_id=1)
     sensor = _wire(camera, detector, window=window)
 
-    executed = []
-    _count_events("plan_executed", executed)
+    counter = EventCounter("detection_completed", "plan_executed")
 
-    # Window fills with 0.9 entropies; the final tick trips the anomaly and,
-    # on the synchronous test bus, runs the whole adaptation chain inline.
-    for _ in range(window):
-        _tick(sensor)
+    # Window fills with 0.9 entropies; the final tick trips the anomaly and
+    # the adaptation chain runs asynchronously on the bus - wait for its end.
+    for i in range(window):
+        _tick(sensor, counter, i)
+    executed = counter.wait_for("plan_executed")
+    counter.close()
 
     assert executed, "plan_executed never fired - adaptation chain did not run"
     assert ss.CORE.detector.model_id == 2, \
@@ -186,23 +198,33 @@ def loop_rejected_plan():
     detector = ScriptedDetector({1: 0.9, 2: 0.95}, model_id=1)
     sensor = _wire(camera, detector, window=window, max_replans=max_replans)
 
-    executed, rejected = [], []
-    _count_events("plan_executed", executed)
-    _count_events("plan_rejected", rejected)
+    counter = EventCounter("detection_completed", "plan_executed",
+                           "plan_rejected")
 
-    for _ in range(window):
-        _tick(sensor)
+    for i in range(window):
+        _tick(sensor, counter, i)
+
+    # The reject/re-plan ping-pong runs asynchronously; the abort (budget
+    # exhausted) is knowledge-only, so wait on the InPlanning flag clearing.
+    assert counter.wait_for("plan_rejected", count=max_replans), \
+        "plan_rejected never reached the replan budget"
+    assert wait_until(
+        lambda: not sensor.read_knowledge(InPlanning).in_planning), \
+        "adaptation was never aborted (InPlanning still set)"
+    rejected = counter.count("plan_rejected")
+    executed = counter.count("plan_executed")
+    counter.close()
 
     assert not executed, "a worse candidate must never reach Execute"
-    assert len(rejected) == max_replans, \
-        f"expected {max_replans} plan_rejected events, got {len(rejected)}"
+    assert rejected == max_replans, \
+        f"expected {max_replans} plan_rejected events, got {rejected}"
     assert ss.CORE.detector.model_id == 1, "model must NOT be swapped"
     assert not sensor.read_knowledge(LegitResult).is_legit
     assert sensor.read_knowledge(ReplanningCounter).count == max_replans + 1, \
         "replan budget not exhausted as expected"
     assert not sensor.read_knowledge(InPlanning).in_planning, \
         "InPlanning must be cleared after the adaptation is aborted"
-    print(f"    candidate rejected {len(rejected) + 1}x, budget exhausted, "
+    print(f"    candidate rejected {rejected + 1}x, budget exhausted, "
           "model 1 kept - Legitimate gate works")
 
 
@@ -217,4 +239,5 @@ if __name__ == "__main__":
             "STEP 3: light-box MAPLE-K loop checks",
         )
     finally:
+        shutdown_nodes()
         close_camera()

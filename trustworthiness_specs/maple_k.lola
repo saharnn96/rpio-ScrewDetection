@@ -1,0 +1,358 @@
+-- ===========================================================================
+-- TRUSTWORTHINESS SPECIFICATION for the MAPLE-K adaptation loop (LOLA).
+--
+-- Judges the trustworthiness of the adaptation BEFORE (is the evidence that
+-- triggers it sound?), DURING (does the episode follow the
+-- Plan -> Legitimate -> Execute protocol within its deadlines and budgets?)
+-- and AFTER (did the committed adaptation do what it promised?).
+--
+-- The runtime monitor is provided by the RV team; this file is the contract.
+-- See trustworthiness_specs/README.md for:
+--   * how each input stream is derived from the system's redis events and
+--     knowledge objects (managing_system/messages.py),
+--   * the tick model and sentinel conventions,
+--   * the property catalogue in prose.
+--
+-- TICK MODEL: one tick per MAPLE-K bus event, plus a periodic timer tick
+-- (>= 1 Hz) so time-bound properties can fire while the loop is quiet. At
+-- every tick all knowledge streams carry the latest stored value.
+--
+-- SENTINELS: missing/None numeric values are fed as -1.0 (or -1 for ids).
+-- Event streams are true only on the tick carrying that event.
+--
+-- DIALECT: in/out declarations, bounded past references s[-1, default],
+-- if-then-else, && || !, arithmetic and comparisons - the common LOLA core.
+-- Adapt declaration syntax to the monitor's parser if it differs (e.g.
+-- typed classic LOLA `input bool e` / `output int x := ...`).
+--
+-- Violation outputs (v_*) use LEVEL semantics: they are true on every tick
+-- on which the property is being violated (timeout streams stay true until
+-- the awaited event arrives). w_* streams are warnings, not violations.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- INPUT STREAMS - events (bus channels)
+-- ---------------------------------------------------------------------------
+in t                        -- seconds since monitor start (float, monotonic)
+in timer_tick               -- true on the periodic heartbeat ticks
+in sensor_data_received     -- pendant RPC / sensor tick entered the loop
+in observation_recorded     -- Monitor captured a frame
+in detection_completed      -- Analysis served detections (unblocks pendant)
+in anomaly_detected         -- Analysis raised an anomaly (episode start)
+in plan_generated           -- Plan proposed a candidate
+in plan_validated           -- Legitimate accepted the candidate
+in plan_rejected            -- Legitimate rejected the candidate
+in plan_executed            -- Execute committed the swap (episode end)
+
+-- ---------------------------------------------------------------------------
+-- INPUT STREAMS - knowledge samples (latest value at each tick)
+-- ---------------------------------------------------------------------------
+in entropy_len              -- len(EntropyHistory.values)
+in running_avg              -- RunningAvgEntropy.value          (-1.0 = None)
+in screw_entropy            -- Detections.screw_entropy         (-1.0 = None)
+in brightness               -- FrameRef.brightness
+in in_planning              -- InPlanning.in_planning (bool)
+in replanning_counter       -- ReplanningCounter.count
+in active_model             -- ActiveModel.model_id
+in candidate_model          -- CandidateModel.model_id          (-1 = None)
+in legit_is_legit           -- LegitResult.is_legit (bool)
+in legit_candidate_model    -- LegitResult.candidate_model_id   (-1 = None)
+in legit_candidate_avg      -- LegitResult.candidate_avg_entropy (-1.0 = None)
+in legit_current_avg        -- LegitResult.current_avg_entropy  (-1.0 = None)
+in action_model             -- ActionCommand.model_id           (-1 = None)
+
+-- ---------------------------------------------------------------------------
+-- PARAMETERS
+-- Keep the first four in sync with Adaptation_Config in
+-- managing_system/config.yaml - they ARE the deployed adaptation policy.
+-- ---------------------------------------------------------------------------
+out entropy_window_size
+entropy_window_size = 10
+out entropy_threshold
+entropy_threshold = 0.35
+out max_replans
+max_replans = 3
+out min_model_id
+min_model_id = 1
+out max_model_id
+max_model_id = 4
+
+out capture_deadline        -- sensor tick -> frame captured
+capture_deadline = 5.0
+out detection_deadline      -- frame captured -> detection served
+detection_deadline = 20.0
+out plan_deadline           -- anomaly/rejection -> new plan
+plan_deadline = 10.0
+out legit_deadline          -- plan -> verdict (re-runs YOLO on the window)
+legit_deadline = 60.0
+out execute_deadline        -- validation -> committed swap
+execute_deadline = 10.0
+out episode_deadline        -- anomaly -> execute or abort (whole episode)
+episode_deadline = 120.0
+out anomaly_grace           -- degraded evidence may go unanswered this long
+anomaly_grace = 10.0
+out stability_window        -- swap-rate window for thrashing detection
+stability_window = 600.0
+out brightness_min
+brightness_min = 5.0
+out brightness_max
+brightness_max = 250.0
+
+-- ---------------------------------------------------------------------------
+-- EPISODE STATE MACHINE (auxiliary)
+-- 0 = idle, 1 = planning, 2 = legitimating, 3 = executing.
+-- A replan-budget abort emits NO event: it is only visible as InPlanning
+-- flipping false mid-episode, hence the fall-back-to-idle clause.
+-- ---------------------------------------------------------------------------
+out phase
+phase =
+    if anomaly_detected then 1
+    else if plan_generated then 2
+    else if plan_rejected then 1
+    else if plan_validated then 3
+    else if plan_executed then 0
+    else if (phase[-1, 0] == 1 || phase[-1, 0] == 2) && !in_planning then 0
+    else phase[-1, 0]
+
+out phase_entered_t         -- when the current phase was entered
+phase_entered_t =
+    if phase != phase[-1, 0] then t else phase_entered_t[-1, 0.0]
+
+out episode_start_t
+episode_start_t =
+    if anomaly_detected then t else episode_start_t[-1, 0.0]
+
+-- ===========================================================================
+-- BEFORE ADAPTATION - is the evidence sound?
+-- ===========================================================================
+
+-- [P1] Loop liveness: every sensor tick is answered by a capture, every
+-- capture by a detection, within their deadlines. The RobotBridge blocks
+-- the UR pendant on detection_completed, and safe_callback swallows node
+-- exceptions, so a silently dead Monitor/Analysis is otherwise invisible.
+-- (Assumes at most one outstanding request - the pendant serializes calls.)
+out awaiting_capture
+awaiting_capture =
+    if sensor_data_received then true
+    else if observation_recorded then false
+    else awaiting_capture[-1, false]
+out sensor_t
+sensor_t = if sensor_data_received then t else sensor_t[-1, 0.0]
+out v_capture_timeout
+v_capture_timeout = awaiting_capture && (t - sensor_t) > capture_deadline
+
+out awaiting_detection
+awaiting_detection =
+    if observation_recorded then true
+    else if detection_completed then false
+    else awaiting_detection[-1, false]
+out observation_t
+observation_t = if observation_recorded then t else observation_t[-1, 0.0]
+out v_detection_timeout
+v_detection_timeout =
+    awaiting_detection && (t - observation_t) > detection_deadline
+
+-- [P2] Analysis sanity: the entropy window never exceeds its configured
+-- size, and published entropies/averages stay in [0, 1] (-1.0 = None is
+-- allowed). Exact mean recomputation needs the raw window contents and is
+-- left to a host-side check by the monitor, if supported.
+out v_window_overflow
+v_window_overflow = entropy_len > entropy_window_size
+out v_entropy_range
+v_entropy_range = detection_completed && screw_entropy > 1.0
+out v_avg_range
+v_avg_range = running_avg > 1.0
+
+-- [P3] Sensor sanity (warning): frame brightness outside the plausible
+-- sensor range points at a camera or lighting fault.
+out w_brightness_range
+w_brightness_range =
+    observation_recorded
+    && (brightness < brightness_min || brightness > brightness_max)
+
+-- [P4] Anomaly soundness: anomaly_detected only with a FULL window whose
+-- running average EXCEEDS the threshold. (Analysis writes InPlanning and
+-- the entropy knowledge before publishing, so sampling at this tick is
+-- race-free.)
+out v_anomaly_unsound
+v_anomaly_unsound =
+    anomaly_detected
+    && !(entropy_len >= entropy_window_size
+         && running_avg > entropy_threshold)
+
+-- [P5] Anomaly completeness: a full window above the threshold with no
+-- episode in flight must raise an anomaly within the grace period -
+-- otherwise the system is degrading silently. (Grace must exceed the frame
+-- period: Analysis is event-driven.)
+out degraded
+degraded =
+    entropy_len >= entropy_window_size
+    && running_avg > entropy_threshold
+    && !in_planning
+out degraded_since
+degraded_since =
+    if !degraded then -1.0
+    else if degraded_since[-1, -1.0] < 0.0 then t
+    else degraded_since[-1, -1.0]
+out v_missed_anomaly
+v_missed_anomaly =
+    degraded_since >= 0.0 && (t - degraded_since) > anomaly_grace
+
+-- ===========================================================================
+-- DURING ADAPTATION - is the episode protocol honored?
+-- ===========================================================================
+
+-- [P6] Protocol conformance: events may only occur in their phase.
+-- v_unlegitimated_execution is the core trustworthiness property: no
+-- actuation without a validated plan.
+out v_overlapping_anomaly
+v_overlapping_anomaly = anomaly_detected && phase[-1, 0] != 0
+out v_unsolicited_plan
+v_unsolicited_plan = plan_generated && phase[-1, 0] != 1
+out v_unsolicited_verdict
+v_unsolicited_verdict =
+    (plan_validated || plan_rejected) && phase[-1, 0] != 2
+out v_unlegitimated_execution
+v_unlegitimated_execution = plan_executed && phase[-1, 0] != 3
+
+-- [P7] Step deadlines: each phase must be left in time.
+out v_plan_timeout
+v_plan_timeout = phase == 1 && (t - phase_entered_t) > plan_deadline
+out v_legit_timeout
+v_legit_timeout = phase == 2 && (t - phase_entered_t) > legit_deadline
+out v_execute_timeout
+v_execute_timeout = phase == 3 && (t - phase_entered_t) > execute_deadline
+
+-- [P8] Bounded adaptation: the whole episode ends (execute or abort)
+-- within its bound - the system must never sit wedged with InPlanning
+-- stuck true, which would also suppress every future anomaly.
+out v_episode_timeout
+v_episode_timeout = phase != 0 && (t - episode_start_t) > episode_deadline
+
+-- [P9] Candidate validity: the proposal is a known model and differs from
+-- the active one - a self-swap can never clear the anomaly that started
+-- the episode. (The current fixed-candidate Plan policy CAN produce this.)
+out v_candidate_unknown
+v_candidate_unknown =
+    plan_generated
+    && (candidate_model < min_model_id || candidate_model > max_model_id)
+out v_candidate_self_swap
+v_candidate_self_swap = plan_generated && candidate_model == active_model
+
+-- [P10] Legitimation-gate consistency: Legitimate's published verdict must
+-- match its own rule - accept iff the candidate beats the current average
+-- OR clears the anomaly threshold. Checked in both directions, plus the
+-- is_legit flag against the event that was published.
+out legit_rule_accepts
+legit_rule_accepts =
+    legit_candidate_avg >= 0.0
+    && (legit_candidate_avg < legit_current_avg
+        || legit_candidate_avg < entropy_threshold)
+out v_unjustified_accept
+v_unjustified_accept = plan_validated && !legit_rule_accepts
+out v_unjustified_reject
+v_unjustified_reject = plan_rejected && legit_rule_accepts
+out v_verdict_flag_mismatch
+v_verdict_flag_mismatch =
+    (plan_validated && !legit_is_legit)
+    || (plan_rejected && legit_is_legit)
+
+-- [P11] Replan budget: at most max_replans rejections per episode, and the
+-- ReplanningCounter must be 0 when an episode starts - an aborted episode
+-- must not leak its count into the next one. (The abort path in the
+-- current Legitimate node does NOT reset the counter; v_counter_leak will
+-- flag that at the start of the following episode.)
+out rejections
+rejections =
+    if anomaly_detected then 0
+    else if plan_rejected then rejections[-1, 0] + 1
+    else rejections[-1, 0]
+out v_replan_budget
+v_replan_budget = plan_rejected && rejections > max_replans
+out v_counter_leak
+v_counter_leak = anomaly_detected && replanning_counter != 0
+
+-- ===========================================================================
+-- AFTER ADAPTATION - did it work?
+-- ===========================================================================
+
+-- [P12] Execute consistency: decision, command and resulting state agree -
+-- the model Legitimate accepted is the model that was commanded and is the
+-- model now active, and the result really was an accept. (Execute writes
+-- all knowledge before publishing, so sampling at this tick is race-free.)
+out v_execute_mismatch
+v_execute_mismatch =
+    plan_executed
+    && !(legit_is_legit
+         && action_model == legit_candidate_model
+         && action_model == active_model)
+
+-- [P13] Post-swap reset: a clean slate for judging the new model - entropy
+-- window empty, planning flag lowered, replan counter zeroed.
+out v_post_reset
+v_post_reset =
+    plan_executed
+    && (entropy_len != 0 || in_planning || replanning_counter != 0)
+
+-- [P14] Adaptation effectiveness: Legitimate validated the candidate on
+-- PAST frames; once the entropy window refills with LIVE frames, the
+-- running average must be back under the threshold - otherwise the swap
+-- did not deliver its promise.
+out assessing_effect
+assessing_effect =
+    if plan_executed then true
+    else if assessing_effect[-1, false]
+            && entropy_len >= entropy_window_size then false
+    else assessing_effect[-1, false]
+out v_ineffective_adaptation
+v_ineffective_adaptation =
+    assessing_effect[-1, false]
+    && entropy_len >= entropy_window_size
+    && running_avg > entropy_threshold
+
+-- [P15] Stability: bounded swap rate (a 4th swap inside the window breaks
+-- the budget of 3) and no A -> B -> A ping-pong - oscillation means the
+-- policy is fighting the environment, not fixing anything.
+out swap1_t                 -- time of the most recent swap
+swap1_t = if plan_executed then t else swap1_t[-1, -1.0e9]
+out swap2_t                 -- time of the swap before that
+swap2_t = if plan_executed then swap1_t[-1, -1.0e9] else swap2_t[-1, -1.0e9]
+out swap3_t                 -- ... and three swaps back
+swap3_t = if plan_executed then swap2_t[-1, -1.0e9] else swap3_t[-1, -1.0e9]
+out v_thrashing
+v_thrashing = plan_executed && (t - swap3_t) < stability_window
+
+out model1                  -- model deployed by the most recent swap
+model1 = if plan_executed then active_model else model1[-1, -1]
+out model2                  -- model deployed by the swap before that
+model2 = if plan_executed then model1[-1, -1] else model2[-1, -1]
+out v_ping_pong
+v_ping_pong =
+    plan_executed
+    && model2[-1, -1] == active_model
+    && model1[-1, -1] != active_model
+    && model2[-1, -1] != -1
+    && (t - swap2_t[-1, -1.0e9]) < stability_window
+
+-- ===========================================================================
+-- AGGREGATED VERDICTS
+-- ===========================================================================
+out violation
+violation =
+    v_capture_timeout || v_detection_timeout
+    || v_window_overflow || v_entropy_range || v_avg_range
+    || v_anomaly_unsound || v_missed_anomaly
+    || v_overlapping_anomaly || v_unsolicited_plan || v_unsolicited_verdict
+    || v_unlegitimated_execution
+    || v_plan_timeout || v_legit_timeout || v_execute_timeout
+    || v_episode_timeout
+    || v_candidate_unknown || v_candidate_self_swap
+    || v_unjustified_accept || v_unjustified_reject
+    || v_verdict_flag_mismatch
+    || v_replan_budget || v_counter_leak
+    || v_execute_mismatch || v_post_reset
+    || v_ineffective_adaptation
+    || v_thrashing || v_ping_pong
+
+out warning
+warning = w_brightness_range

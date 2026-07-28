@@ -1,0 +1,425 @@
+// Run with:
+// cargo run --profile dev-fast --features redis -- trustworthiness_specs/maple_k.dsrv --input-file <trace-file>
+//
+// (adjust --profile/--features to whatever this build calls its redis event
+// adapter - only the spec path is specific to this repo; --input-file takes
+// a recorded trace for offline replay, same as the .dsrv examples this was
+// modeled on)
+//
+// ===========================================================================
+// TRUSTWORTHINESS SPECIFICATION for the MAPLE-K adaptation loop (DSRV port).
+//
+// Same 15 properties as trustworthiness_specs/maple_k.lola (plain LOLA),
+// P1-P15, grouped BEFORE / DURING / AFTER an adaptation episode - re-expressed
+// in this grammar's Struct/List/default()/List.fold idiom. Read maple_k.lola
+// and its README first; this file assumes that context and only calls out
+// where the two diverge.
+//
+// STREAM PROVENANCE
+//   in new_data          - one record per MAPLE-K bus event. rpclpy publishes
+//                          each event to the bare event-key redis channel
+//                          (`anomaly_detected`, not `/anomaly_detected`) with
+//                          a JSON {uid, timestamp} payload; the adapter
+//                          feeding this monitor is assumed to multiplex all
+//                          8 channels onto this one struct-tagged stream
+//                          (event = the channel name) plus a synthetic
+//                          "timer_tick" record at >=1 Hz so deadline
+//                          properties can fire while the loop is quiet, and a
+//                          numeric `t` (seconds since the monitor attached,
+//                          monotonic) since the real payload's `timestamp` is
+//                          an ISO-8601 string, not a number.
+//   in frame_ref, entropy_history, running_avg_entropy, in_planning,
+//   replanning_counter, active_model, candidate_model, legit_result,
+//   action_command
+//                        - one dedicated stream per knowledge class in
+//                          managing_system/messages.py, refreshed with the
+//                          latest pickled value on every tick. Every one of
+//                          them carries MORE fields than declared below:
+//                          rpclpy's write_knowledge_as_object() stamps `uid`
+//                          and `timestamp` onto every object at write time
+//                          (node.py), which is exactly what the trailing
+//                          `...` on each Struct type is for.
+//   Sentinels: None/missing numerics come through as -1.0 (ids as -1); a
+//   missing Bool defaults to false - same convention as maple_k.lola so the
+//   two specs stay directly comparable.
+//
+// A NOTE OF IMPROVEMENT OVER THE PLAIN-LOLA VERSION: plain LOLA has no
+// arrays, so maple_k.lola could only bound entropy values and window length,
+// leaving the mean-recomputation part of P2 to a host-side check. This
+// grammar's List<Float> + List.fold lets P2 recompute the window mean
+// exactly and compare it to the published RunningAvgEntropy (v_avg_mismatch
+// below) - a strictly stronger check than the plain-LOLA spec.
+//
+// GRAMMAR NOTES (confirmed vs. extrapolated from the one worked example this
+// is modeled on - flag to the RV team if any of the extrapolated bits differ
+// from the real parser):
+//   confirmed:    in/out decls, Struct<...> incl. trailing `...`, List<T>,
+//                 List.fold(\acc,e -> expr, init, list), List.head(list),
+//                 if/then/else, default(expr, fallback), stream[1] (one tick
+//                 back), struct literals {field: v, ...}, field access `.f`,
+//                 && || !, == < <= >=, string literals, lambdas.
+//   extrapolated: `>`, `!=`, `-` and `/` on Float/Int (the example only used
+//                 `+`); Int/Float are kept as separately-tallied streams
+//                 everywhere (see entropy_window_len vs. _len_f) rather than
+//                 assuming implicit numeric coercion.
+// ===========================================================================
+
+in new_data: Struct<event: Str, uid: Str, t: Float, ...>
+
+in frame_ref: Struct<brightness: Float, ...>
+in entropy_history: Struct<values: List<Float>, ...>
+in running_avg_entropy: Struct<value: Float, ...>
+in in_planning: Struct<in_planning: Bool, ...>
+in replanning_counter: Struct<count: Int, ...>
+in active_model: Struct<model_id: Int, ...>
+in candidate_model: Struct<model_id: Int, ...>
+in legit_result: Struct<is_legit: Bool, candidate_model_id: Int, candidate_avg_entropy: Float, current_avg_entropy: Float, ...>
+in action_command: Struct<model_id: Int, ...>
+
+// ---------------------------------------------------------------------
+// OUT DECLARATIONS
+// ---------------------------------------------------------------------
+
+// ---- parameters - keep in sync with Adaptation_Config in
+// managing_system/config.yaml; these ARE the deployed adaptation policy ----
+out entropy_window_size: Int
+out entropy_threshold: Float
+out max_replans: Int
+out min_model_id: Int
+out max_model_id: Int
+out capture_deadline: Float
+out detection_deadline: Float
+out plan_deadline: Float
+out legit_deadline: Float
+out execute_deadline: Float
+out episode_deadline: Float
+out anomaly_grace: Float
+out stability_window: Float
+out brightness_min: Float
+out brightness_max: Float
+out consistency_tolerance: Float
+out sentinel_past_t: Float
+
+// ---- clock + event booleans, demultiplexed from new_data ----
+out t: Float
+out sensor_data_received: Bool
+out observation_recorded: Bool
+out detection_completed: Bool
+out anomaly_detected: Bool
+out plan_generated: Bool
+out plan_validated: Bool
+out plan_rejected: Bool
+out plan_executed: Bool
+out timer_tick: Bool
+out the_data: Struct<event: Str, uid: Str, t: Float, ...>   // raw passthrough, for tracing
+
+// ---- entropy window arithmetic (shared by P2, P4, P5, P14) ----
+out entropy_window_len: Int
+out entropy_window_len_f: Float
+out entropy_window_sum: Float
+out entropy_window_mean: Float
+out entropy_window_out_of_range: Bool
+
+// ---- episode state machine: 0 idle, 1 planning, 2 legitimating, 3 executing ----
+out phase: Int
+out phase_entered_t: Float
+out episode_start_t: Float
+
+// ---- P1 loop liveness ----
+out awaiting_capture: Bool
+out sensor_t: Float
+out v_capture_timeout: Bool
+out awaiting_detection: Bool
+out observation_t: Float
+out v_detection_timeout: Bool
+
+// ---- P2 analysis consistency ----
+out v_window_overflow: Bool
+out v_entropy_range: Bool
+out v_avg_range: Bool
+out v_avg_mismatch: Bool
+
+// ---- P3 sensor sanity (warning) ----
+out w_brightness_range: Bool
+
+// ---- P4 anomaly soundness ----
+out v_anomaly_unsound: Bool
+
+// ---- P5 anomaly completeness ----
+out degraded: Bool
+out degraded_since: Float
+out v_missed_anomaly: Bool
+
+// ---- P6 episode protocol conformance ----
+out v_overlapping_anomaly: Bool
+out v_unsolicited_plan: Bool
+out v_unsolicited_verdict: Bool
+out v_unlegitimated_execution: Bool
+
+// ---- P7 per-step deadlines ----
+out v_plan_timeout: Bool
+out v_legit_timeout: Bool
+out v_execute_timeout: Bool
+
+// ---- P8 whole-episode bound ----
+out v_episode_timeout: Bool
+
+// ---- P9 candidate validity ----
+out v_candidate_unknown: Bool
+out v_candidate_self_swap: Bool
+
+// ---- P10 legitimation-gate consistency ----
+out legit_rule_accepts: Bool
+out v_unjustified_accept: Bool
+out v_unjustified_reject: Bool
+out v_verdict_flag_mismatch: Bool
+
+// ---- P11 replan budget ----
+out rejections: Int
+out v_replan_budget: Bool
+out v_counter_leak: Bool
+
+// ---- P12 execute consistency ----
+out v_execute_mismatch: Bool
+
+// ---- P13 post-swap reset ----
+out v_post_reset: Bool
+
+// ---- P14 adaptation effectiveness ----
+out assessing_effect: Bool
+out v_ineffective_adaptation: Bool
+
+// ---- P15 stability (swap rate + ping-pong) ----
+out swap1_t: Float
+out swap2_t: Float
+out swap3_t: Float
+out v_thrashing: Bool
+out model1: Int
+out model2: Int
+out v_ping_pong: Bool
+
+// ---- aggregated verdicts ----
+out violation: Bool
+out warning: Bool
+
+// ---------------------------------------------------------------------
+// DEFINITIONS
+// ---------------------------------------------------------------------
+
+// ---- parameters ----
+entropy_window_size = 10
+entropy_threshold = 0.35
+max_replans = 3
+min_model_id = 1
+max_model_id = 4
+capture_deadline = 5.0
+detection_deadline = 20.0
+plan_deadline = 10.0
+legit_deadline = 60.0
+execute_deadline = 10.0
+episode_deadline = 120.0
+anomaly_grace = 10.0
+stability_window = 600.0
+brightness_min = 5.0
+brightness_max = 250.0
+consistency_tolerance = 0.000001
+sentinel_past_t = -1000000000.0
+
+// ---- clock + event booleans ----
+t = new_data.t
+sensor_data_received = new_data.event == "sensor_data_received"
+observation_recorded = new_data.event == "observation_recorded"
+detection_completed = new_data.event == "detection_completed"
+anomaly_detected = new_data.event == "anomaly_detected"
+plan_generated = new_data.event == "plan_generated"
+plan_validated = new_data.event == "plan_validated"
+plan_rejected = new_data.event == "plan_rejected"
+plan_executed = new_data.event == "plan_executed"
+timer_tick = new_data.event == "timer_tick"
+the_data = new_data
+
+// ---- entropy window arithmetic ----
+// (Int and Float tallies kept separate rather than assuming Int/Float
+// arithmetic coerces implicitly - see grammar notes above.)
+entropy_window_len = List.fold(\acc: Int, e: Float -> acc + 1, 0, entropy_history.values)
+entropy_window_len_f = List.fold(\acc: Float, e: Float -> acc + 1.0, 0.0, entropy_history.values)
+entropy_window_sum = List.fold(\acc: Float, e: Float -> acc + e, 0.0, entropy_history.values)
+entropy_window_mean = if entropy_window_len_f == 0.0 then 0.0 else entropy_window_sum / entropy_window_len_f
+entropy_window_out_of_range = List.fold(\acc: Bool, e: Float -> acc || e < 0.0 || e > 1.0, false, entropy_history.values)
+
+// ---- episode state machine ----
+// A replan-budget abort emits NO event - it is only visible as InPlanning
+// flipping false mid-episode - hence the fall-back-to-idle clause.
+phase = if anomaly_detected then 1
+        else if plan_generated then 2
+        else if plan_rejected then 1
+        else if plan_validated then 3
+        else if plan_executed then 0
+        else if (default(phase[1], 0) == 1 || default(phase[1], 0) == 2) && !in_planning.in_planning then 0
+        else default(phase[1], 0)
+
+phase_entered_t = if phase != default(phase[1], 0) then t else default(phase_entered_t[1], 0.0)
+
+episode_start_t = if anomaly_detected then t else default(episode_start_t[1], 0.0)
+
+// ---- P1: sensor tick -> capture -> detection, each within its deadline.
+// (Assumes at most one outstanding request - the pendant serializes calls.) ----
+awaiting_capture = if sensor_data_received then true
+                    else if observation_recorded then false
+                    else default(awaiting_capture[1], false)
+
+sensor_t = if sensor_data_received then t else default(sensor_t[1], 0.0)
+
+v_capture_timeout = awaiting_capture && (t - sensor_t) > capture_deadline
+
+awaiting_detection = if observation_recorded then true
+                      else if detection_completed then false
+                      else default(awaiting_detection[1], false)
+
+observation_t = if observation_recorded then t else default(observation_t[1], 0.0)
+
+v_detection_timeout = awaiting_detection && (t - observation_t) > detection_deadline
+
+// ---- P2: window length bound, value ranges, and (unlike plain LOLA) an
+// exact recomputed-mean check against the published RunningAvgEntropy ----
+v_window_overflow = entropy_window_len > entropy_window_size
+
+v_entropy_range = entropy_window_out_of_range
+
+v_avg_range = running_avg_entropy.value > 1.0
+
+v_avg_mismatch = entropy_window_len > 0
+              && running_avg_entropy.value >= 0.0
+              && (entropy_window_mean - running_avg_entropy.value > consistency_tolerance
+                  || running_avg_entropy.value - entropy_window_mean > consistency_tolerance)
+
+// ---- P3: frame brightness within a plausible sensor range (warning, not
+// a violation - outside it points at a camera/lighting fault) ----
+w_brightness_range = observation_recorded
+                   && (frame_ref.brightness < brightness_min || frame_ref.brightness > brightness_max)
+
+// ---- P4: anomaly_detected only with a full window whose average exceeds
+// the threshold ----
+v_anomaly_unsound = anomaly_detected
+                  && !(entropy_window_len >= entropy_window_size
+                       && running_avg_entropy.value > entropy_threshold)
+
+// ---- P5: no silent degradation - a full window above threshold with no
+// episode in flight must raise an anomaly within the grace period ----
+degraded = entropy_window_len >= entropy_window_size
+        && running_avg_entropy.value > entropy_threshold
+        && !in_planning.in_planning
+
+degraded_since = if !degraded then -1.0
+                 else if default(degraded_since[1], -1.0) < 0.0 then t
+                 else default(degraded_since[1], -1.0)
+
+v_missed_anomaly = degraded_since >= 0.0 && (t - degraded_since) > anomaly_grace
+
+// ---- P6: state-machine conformance - the core property is
+// v_unlegitimated_execution (no actuation without a validated plan) ----
+v_overlapping_anomaly = anomaly_detected && default(phase[1], 0) != 0
+
+v_unsolicited_plan = plan_generated && default(phase[1], 0) != 1
+
+v_unsolicited_verdict = (plan_validated || plan_rejected) && default(phase[1], 0) != 2
+
+v_unlegitimated_execution = plan_executed && default(phase[1], 0) != 3
+
+// ---- P7: each phase must be left within its deadline ----
+v_plan_timeout = phase == 1 && (t - phase_entered_t) > plan_deadline
+
+v_legit_timeout = phase == 2 && (t - phase_entered_t) > legit_deadline
+
+v_execute_timeout = phase == 3 && (t - phase_entered_t) > execute_deadline
+
+// ---- P8: the whole episode ends (execute or abort) within its bound ----
+v_episode_timeout = phase != 0 && (t - episode_start_t) > episode_deadline
+
+// ---- P9: candidate is a known model and differs from the active one -
+// a self-swap can never clear the anomaly that started the episode
+// (the current fixed-candidate Plan policy CAN produce this) ----
+v_candidate_unknown = plan_generated
+                    && (candidate_model.model_id < min_model_id || candidate_model.model_id > max_model_id)
+
+v_candidate_self_swap = plan_generated && candidate_model.model_id == active_model.model_id
+
+// ---- P10: Legitimate's published verdict must match its own rule -
+// accept iff candidate beats the current average OR clears the threshold -
+// checked in both directions, plus the is_legit flag against the event ----
+legit_rule_accepts = legit_result.candidate_avg_entropy >= 0.0
+                   && (legit_result.candidate_avg_entropy < legit_result.current_avg_entropy
+                       || legit_result.candidate_avg_entropy < entropy_threshold)
+
+v_unjustified_accept = plan_validated && !legit_rule_accepts
+
+v_unjustified_reject = plan_rejected && legit_rule_accepts
+
+v_verdict_flag_mismatch = (plan_validated && !legit_result.is_legit)
+                        || (plan_rejected && legit_result.is_legit)
+
+// ---- P11: at most max_replans rejections per episode, and the counter must
+// be 0 when an episode starts - an aborted episode must not leak its count
+// into the next one (the current Legitimate abort path does NOT reset it) ----
+rejections = if anomaly_detected then 0
+             else if plan_rejected then default(rejections[1], 0) + 1
+             else default(rejections[1], 0)
+
+v_replan_budget = plan_rejected && rejections > max_replans
+
+v_counter_leak = anomaly_detected && replanning_counter.count != 0
+
+// ---- P12: decision, command and resulting state all agree ----
+v_execute_mismatch = plan_executed
+                   && !(legit_result.is_legit
+                        && action_command.model_id == legit_result.candidate_model_id
+                        && action_command.model_id == active_model.model_id)
+
+// ---- P13: clean slate for judging the new model ----
+v_post_reset = plan_executed
+             && (entropy_window_len != 0 || in_planning.in_planning || replanning_counter.count != 0)
+
+// ---- P14: Legitimate validated on PAST frames; once the window refills
+// with LIVE frames the average must be back under the threshold ----
+assessing_effect = if plan_executed then true
+                    else if default(assessing_effect[1], false) && entropy_window_len >= entropy_window_size then false
+                    else default(assessing_effect[1], false)
+
+v_ineffective_adaptation = default(assessing_effect[1], false)
+                        && entropy_window_len >= entropy_window_size
+                        && running_avg_entropy.value > entropy_threshold
+
+// ---- P15: bounded swap rate, and no A -> B -> A ping-pong ----
+swap1_t = if plan_executed then t else default(swap1_t[1], sentinel_past_t)
+
+swap2_t = if plan_executed then default(swap1_t[1], sentinel_past_t) else default(swap2_t[1], sentinel_past_t)
+
+swap3_t = if plan_executed then default(swap2_t[1], sentinel_past_t) else default(swap3_t[1], sentinel_past_t)
+
+v_thrashing = plan_executed && (t - swap3_t) < stability_window
+
+model1 = if plan_executed then active_model.model_id else default(model1[1], -1)
+
+model2 = if plan_executed then default(model1[1], -1) else default(model2[1], -1)
+
+v_ping_pong = plan_executed
+           && default(model2[1], -1) == active_model.model_id
+           && default(model1[1], -1) != active_model.model_id
+           && default(model2[1], -1) != -1
+           && (t - default(swap2_t[1], sentinel_past_t)) < stability_window
+
+// ---- aggregated verdicts ----
+violation = v_capture_timeout || v_detection_timeout
+         || v_window_overflow || v_entropy_range || v_avg_range || v_avg_mismatch
+         || v_anomaly_unsound || v_missed_anomaly
+         || v_overlapping_anomaly || v_unsolicited_plan || v_unsolicited_verdict || v_unlegitimated_execution
+         || v_plan_timeout || v_legit_timeout || v_execute_timeout
+         || v_episode_timeout
+         || v_candidate_unknown || v_candidate_self_swap
+         || v_unjustified_accept || v_unjustified_reject || v_verdict_flag_mismatch
+         || v_replan_budget || v_counter_leak
+         || v_execute_mismatch || v_post_reset
+         || v_ineffective_adaptation
+         || v_thrashing || v_ping_pong
+
+warning = w_brightness_range

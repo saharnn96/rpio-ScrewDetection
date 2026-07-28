@@ -141,6 +141,16 @@ python tests/test_real_bridge.py           # step 4: pendant XML-RPC contract
 python tests/test_real_adapters.py         # step 5: field-deployment checks
 ```
 
+### Trustworthiness specification (runtime verification)
+
+`trustworthiness_specs/` holds the runtime-verification specification for
+the loop — the properties a trustworthiness checker verifies before, during
+and after each adaptation (anomaly soundness, the Plan → Legitimate →
+Execute protocol and its deadlines/budgets, post-swap consistency and
+effectiveness). The spec is written in LOLA (`maple_k.lola`); the monitor
+itself is developed by the RV team against the stream contract documented
+in `trustworthiness_specs/README.md`.
+
 ---
 
 ## Simulation notes

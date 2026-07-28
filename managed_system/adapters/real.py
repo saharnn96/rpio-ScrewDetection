@@ -181,8 +181,12 @@ class RealDetector:
     CLOSEUP_MODEL_IDS = frozenset({1, 2})
 
     # Bbox-detection ids that run through the run_uq / entropy path. The seg
-    # model (id 4) is intentionally excluded.
+    # model (id 4) runs through `_detect_segmentation` instead.
     _BBOX_MODEL_IDS = frozenset(MODEL_PATHS)
+
+    # Discard tiny mask artifacts before they become oriented bboxes - same
+    # thresholds as the original's min_screen(_frame)_mask_area_ratio_threshold.
+    SEG_AREA_RATIO_THRESHOLDS = {"screen": 0.15, "screen_frame": 0.05}
 
     def __init__(self, model_id=1, T=10, uq_config=(0.05,), model_paths=None):
         """`model_paths` optionally overrides MODEL_PATHS entries (dict of
@@ -194,6 +198,7 @@ class RealDetector:
         self.T = T
         self.uq_config = list(uq_config)
         paths = dict(self.MODEL_PATHS)
+        paths.update(self.SEG_MODEL_PATHS)
         for mid, path in (model_paths or {}).items():
             paths[int(mid)] = os.path.join(_REPO_ROOT, path)
         self._models = {}
@@ -207,18 +212,22 @@ class RealDetector:
                 loaded_by_path[path] = m
             self._models[mid] = loaded_by_path[path]
 
+        # Oriented bboxes (4 corner points each) from the last segmentation
+        # detect(), consumed by ScrewDetectionCore.get_screen_coords(). Mirrors
+        # the original's self.detected_oriented_bbox_screen(_frame) instance
+        # state - only the bridge (same process) reads these back.
+        self.last_oriented_bbox_screen = []
+        self.last_oriented_bbox_screen_frame = []
+
     def detect(self, image, model_id):
+        if model_id in self.SEG_MODEL_PATHS:
+            # Seg model (screen/screen_frame): masks -> oriented bboxes, no UQ.
+            return self._detect_segmentation(image, model_id)
+        if model_id not in self._BBOX_MODEL_IDS:
+            raise ValueError(f"Unknown model_id={model_id}")
+
         # Lazy import so this module works without deepluq installed.
         from managed_system.uq import run_uq
-
-        if model_id not in self._BBOX_MODEL_IDS:
-            # Seg model (screen/screen_frame): masks, no UQ, and coordinate
-            # extraction via oriented bboxes - none of that is ported onto the
-            # core yet. Fail loudly rather than silently mis-detecting.
-            raise NotImplementedError(
-                f"model_id={model_id} is a segmentation model; the mask/coord "
-                "path is not ported onto ScrewDetectionCore yet."
-            )
 
         model = self._models[model_id]
         uq_preds = run_uq(model, image, T=self.T,
@@ -260,6 +269,76 @@ class RealDetector:
                 screw_entropy = r.entropy
 
         return results, screw_entropy
+
+    def _detect_segmentation(self, image, model_id):
+        """Screen/screen_frame seg model: predict masks, drop tiny artifacts,
+        turn surviving masks into oriented bboxes (4 corner points each).
+
+        Port of the original's predict() + convert_results() + plot_masks()
+        for the SCREEN_AND_SCREEN_FRAME path. No UQ, no entropy - this task is
+        never adaptive (see ADAPTIVE_DETECTION_TYPES).
+        """
+        import cv2
+
+        model = self._models[model_id]
+        preds = model.predict(image, conf=0.75, verbose=False, iou=0.1)
+        pred = preds[0]
+
+        oriented_bbox_screen = []
+        oriented_bbox_screen_frame = []
+        results = []
+
+        if pred.masks is not None:
+            for box, mask_t in zip(pred.boxes, pred.masks.data):
+                class_id = int(box.cls)
+                class_name = model.names[class_id]
+                mask = mask_t.cpu().numpy().astype("uint8")
+                mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]),
+                                          interpolation=cv2.INTER_NEAREST)
+
+                threshold = self.SEG_AREA_RATIO_THRESHOLDS.get(class_name)
+                if threshold is not None:
+                    area_ratio = self._mask_area_ratio(mask_resized)
+                    if area_ratio < threshold:
+                        continue
+
+                oriented_bbox = self._oriented_bbox_from_mask(mask_resized, cv2)
+                if oriented_bbox is None:
+                    continue
+
+                if class_name == "screen":
+                    oriented_bbox_screen.append(oriented_bbox)
+                elif class_name == "screen_frame":
+                    oriented_bbox_screen_frame.append(oriented_bbox)
+
+                results.append(DetectionResult(
+                    label=class_id,
+                    box=box.xyxy[0].cpu().numpy().astype(float),
+                    score=float(box.conf[0]),
+                    mask=mask,
+                    entropy=None,
+                ))
+
+        self.last_oriented_bbox_screen = oriented_bbox_screen
+        self.last_oriented_bbox_screen_frame = oriented_bbox_screen_frame
+
+        return results, None
+
+    @staticmethod
+    def _mask_area_ratio(mask_resized):
+        frame_area = mask_resized.shape[0] * mask_resized.shape[1]
+        if frame_area <= 0:
+            return 0.0
+        return float(np.count_nonzero(mask_resized > 0) / frame_area)
+
+    @staticmethod
+    def _oriented_bbox_from_mask(mask_resized, cv2):
+        y_idx, x_idx = np.where(mask_resized > 0)
+        if len(x_idx) == 0:
+            return None
+        points = np.column_stack((x_idx, y_idx))
+        rect = cv2.minAreaRect(points)
+        return np.intp(cv2.boxPoints(rect))
 
     def _detect_holders(self, image, model_id):
         """Plain (non-UQ) holder pre-pass: predict at conf 0.75 and keep only

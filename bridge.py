@@ -114,13 +114,19 @@ class LoggingXMLRPCServer(SimpleXMLRPCServer):
 # detection_completed event before returning.
 # ---------------------------------------------------------------------------
 
-# UR pendant object type -> detection class label. The screen types come from
-# the seg model, whose mask/oriented-bbox path is not ported yet.
+# UR pendant object type -> detection class label.
 _OBJ_TYPE_TO_LABEL = {
     "holder": DetectionClasses.HOLDER.value,
     "screw": DetectionClasses.SCREW.value,
     "noscrew": DetectionClasses.NOSCREW.value,
 }
+
+# Screen types come from the seg model; ScrewDetectionCore.get_screen_coords
+# reads its oriented bboxes straight off the detector instead of Detections
+# knowledge (see core.py for why).
+_SCREEN_OBJ_TYPES = frozenset(
+    {"screen", "screen_frame", "screen_center", "screen_frame_center"}
+)
 
 
 class RobotBridge(Node):
@@ -163,22 +169,33 @@ class RobotBridge(Node):
             )
         return None  # coords fetched via get_detected_object_coords
 
+    @staticmethod
+    def _pose_list(frame_ref):
+        pose = frame_ref.tcp_pose
+        if isinstance(pose, dict):
+            pose = [pose["x"], pose["y"], pose["z"],
+                    pose["rx"], pose["ry"], pose["rz"]]
+        return pose
+
     def get_detected_object_coords(self, obj_type, camera_view="close"):
         """Called by the UR pendant to fetch the last-cycle detection coords.
 
         Returns a flat [x,y,z, x,y,z, ...] list in the robot base frame,
         sorted the same way the original get_detected_object_coords_list did.
         """
+        if obj_type in _SCREEN_OBJ_TYPES:
+            frame_ref = self.read_knowledge(FrameRef)
+            if frame_ref is None or frame_ref.tcp_pose is None:
+                print("No detection cycle has completed yet.")
+                return []
+            return dc.CORE.get_screen_coords(
+                obj_type, self._pose_list(frame_ref), camera_view=camera_view)
+
         if obj_type not in _OBJ_TYPE_TO_LABEL:
-            if obj_type in ("screen", "screen_frame", "screen_center",
-                            "screen_frame_center"):
-                raise NotImplementedError(
-                    f"obj_type={obj_type!r} needs the segmentation model, whose "
-                    "mask/oriented-bbox path is not ported onto the core yet."
-                )
             raise ValueError(
-                f"Invalid obj_type {obj_type!r}. "
-                "Choose 'holder', 'screw' or 'noscrew'."
+                f"Invalid obj_type {obj_type!r}. Choose 'holder', 'screw', "
+                "'noscrew', 'screen', 'screen_frame', 'screen_center' or "
+                "'screen_frame_center'."
             )
 
         dets = self.read_knowledge(Detections)
@@ -187,10 +204,7 @@ class RobotBridge(Node):
             print("No detection cycle has completed yet.")
             return []
 
-        pose = frame_ref.tcp_pose
-        if isinstance(pose, dict):
-            pose = [pose["x"], pose["y"], pose["z"],
-                    pose["rx"], pose["ry"], pose["rz"]]
+        pose = self._pose_list(frame_ref)
 
         label = _OBJ_TYPE_TO_LABEL[obj_type]
         centers = [

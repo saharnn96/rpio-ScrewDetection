@@ -288,11 +288,13 @@ def rpc_fault_correlation():
             return fault.faultString
         raise AssertionError("expected an xmlrpc Fault, got a normal return")
 
-    # Invalid obj_type -> ValueError; unported screen type -> NotImplementedError.
+    # Invalid obj_type -> ValueError. "screen" is a valid type but the scripted
+    # detector never populates last_oriented_bbox_screen, so it must come back
+    # empty rather than fault (mirrors "no screen detected this cycle").
     msg = expect_fault(lambda: client.get_detected_object_coords("bogus"),
                        "[rpc:", "ValueError")
-    expect_fault(lambda: client.get_detected_object_coords("screen"),
-                 "[rpc:", "NotImplementedError")
+    assert client.get_detected_object_coords("screen") == [], \
+        "screen obj_type with no seg detection must return [], not fault"
 
     # A failure deep inside the MAPLE-K cycle must also surface as a Fault
     # (not a hang forever). On the real async bus the exception cannot travel

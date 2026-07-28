@@ -8,8 +8,17 @@ by the RV team; this is the contract they implement against.
 * [`maple_k.lola`](maple_k.lola) — the specification in LOLA (stream
   equations). Each property is a `v_*` (violation) or `w_*` (warning)
   output stream; `violation` / `warning` aggregate them.
+* [`maple_k.dsrv`](maple_k.dsrv) — the same 15 properties ported to the
+  `.dsrv` grammar the RV team's checker actually runs (`in`/`out` streams,
+  `Struct<...>`/`List<...>` types, `default()`/`stream[1]` past references,
+  `List.fold`). Bus events are demultiplexed from one tagged `new_data`
+  stream and knowledge from one dedicated struct per class, mirroring the
+  worked example the team supplied. Its header comment documents the
+  provenance mapping and flags which bits of syntax are confirmed by that
+  example vs. reasonable extrapolations to double-check with them.
 * This README — how to derive the input streams from the running system,
-  the tick model, and the property catalogue in prose.
+  the tick model, and the property catalogue in prose (written against the
+  LOLA file; the mapping is the same for the `.dsrv` port modulo syntax).
 
 The LOLA file uses only the common core of the language (`in`/`out`
 declarations, bounded past references `s[-1, default]`, `if-then-else`,

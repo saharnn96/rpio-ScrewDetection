@@ -293,14 +293,16 @@ class RealDetector:
                 class_id = int(box.cls)
                 class_name = model.names[class_id]
                 mask = mask_t.cpu().numpy().astype("uint8")
+                mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]),
+                                          interpolation=cv2.INTER_NEAREST)
 
                 threshold = self.SEG_AREA_RATIO_THRESHOLDS.get(class_name)
                 if threshold is not None:
-                    area_ratio = self._mask_area_ratio(mask, image.shape, cv2)
+                    area_ratio = self._mask_area_ratio(mask_resized)
                     if area_ratio < threshold:
                         continue
 
-                oriented_bbox = self._oriented_bbox_from_mask(mask, image.shape, cv2)
+                oriented_bbox = self._oriented_bbox_from_mask(mask_resized, cv2)
                 if oriented_bbox is None:
                     continue
 
@@ -323,18 +325,14 @@ class RealDetector:
         return results, None
 
     @staticmethod
-    def _mask_area_ratio(mask, frame_shape, cv2):
-        mask_resized = cv2.resize(mask, (frame_shape[1], frame_shape[0]),
-                                  interpolation=cv2.INTER_NEAREST)
-        frame_area = int(frame_shape[0] * frame_shape[1])
+    def _mask_area_ratio(mask_resized):
+        frame_area = mask_resized.shape[0] * mask_resized.shape[1]
         if frame_area <= 0:
             return 0.0
         return float(np.count_nonzero(mask_resized > 0) / frame_area)
 
     @staticmethod
-    def _oriented_bbox_from_mask(mask, frame_shape, cv2):
-        mask_resized = cv2.resize(mask, (frame_shape[1], frame_shape[0]),
-                                  interpolation=cv2.INTER_NEAREST)
+    def _oriented_bbox_from_mask(mask_resized, cv2):
         y_idx, x_idx = np.where(mask_resized > 0)
         if len(x_idx) == 0:
             return None

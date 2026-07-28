@@ -318,6 +318,48 @@ class ScrewDetectionCore:
         cam_coord_in_base_frame = T_base2cam @ P_cam
         return cam_coord_in_base_frame[:3]
 
+    @staticmethod
+    def get_center_of_bbox(bbox):
+        """Pixel centroid of an oriented bbox's 4 corner points."""
+        import numpy as np
+        center = np.mean(bbox, axis=0)
+        return [int(center[0]), int(center[1])]
+
+    def get_screen_coords(self, obj_type, tcp_pose, camera_view="close"):
+        """Base-frame coords for the segmentation model's screen/screen_frame
+        detections. `obj_type` is one of 'screen', 'screen_frame',
+        'screen_center', 'screen_frame_center'.
+
+        Port of the original's get_detected_object_coords_list() branches for
+        the seg model: 'screen'/'screen_frame' return the 4 oriented-bbox
+        corners (base frame), the '_center' variants return a single centroid
+        point. Reads `last_oriented_bbox_screen(_frame)` off the detector,
+        populated by RealDetector._detect_segmentation() on the last cycle.
+        """
+        screen = getattr(self.detector, "last_oriented_bbox_screen", [])
+        screen_frame = getattr(self.detector, "last_oriented_bbox_screen_frame", [])
+
+        if obj_type == "screen":
+            bbox_list = screen
+        elif obj_type == "screen_frame":
+            bbox_list = screen_frame
+        elif obj_type == "screen_center":
+            if not screen:
+                return []
+            return self.get_coordinates_list(
+                [self.get_center_of_bbox(screen[0])], tcp_pose, camera_view=camera_view)
+        elif obj_type == "screen_frame_center":
+            if not screen_frame:
+                return []
+            return self.get_coordinates_list(
+                [self.get_center_of_bbox(screen_frame[0])], tcp_pose, camera_view=camera_view)
+        else:
+            raise ValueError(f"Invalid obj_type {obj_type!r}.")
+
+        if not bbox_list:
+            return []
+        return self.get_coordinates_list(bbox_list[0], tcp_pose, camera_view=camera_view)
+
     def get_coordinates_list(self, bbox_centers, tcp_pose, camera_view="close"):
         """Transform bbox centers to base-frame coords, sorted and flattened
         exactly like the original (sort by y with tolerance, then x)."""

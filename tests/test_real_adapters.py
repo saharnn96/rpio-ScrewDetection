@@ -11,7 +11,8 @@ same script verifies the real thing:
                                        (regression guard for the label swap).
     2. check_detector_static_config  : uq_config=0.05, closeup ids, routing
                                        tables - parity with the original.
-    3. check_model_weights_on_disk   : every MODEL_PATHS weight file exists.
+    3. check_model_weights_on_disk   : every MODEL_PATHS/SEG_MODEL_PATHS weight
+                                       file exists.
     4. check_original_modules_importable : the vendored RDTEReceive package
                                        and managed_system.uq resolve from
                                        the repo root.
@@ -23,7 +24,8 @@ same script verifies the real thing:
                                            agree with DetectionClasses.
     7. check_real_detector_contract     : detect() honours the adapter
                                            contract + the inside-holder filter.
-    8. check_real_detector_seg_guard    : seg model id fails loudly.
+    8. check_real_detector_seg_model    : seg model id (4) returns oriented
+                                           bboxes, no UQ/entropy.
     9. check_real_camera                : RealCamera color/depth/exposure.
    10. check_real_rtde                  : RealRTDE TCP pose from the robot
                                            (ROBOT_IP env var, default
@@ -108,13 +110,14 @@ def check_detector_static_config():
 
 
 def check_model_weights_on_disk():
-    """Every bbox model id must point at an existing weights file."""
+    """Every bbox + seg model id must point at an existing weights file."""
     from managed_system.adapters.real import RealDetector
+    all_paths = {**RealDetector.MODEL_PATHS, **RealDetector.SEG_MODEL_PATHS}
     missing = [f"id {mid}: {path}"
-               for mid, path in RealDetector.MODEL_PATHS.items()
+               for mid, path in all_paths.items()
                if not os.path.exists(path)]
     assert not missing, "missing weight files:\n      " + "\n      ".join(missing)
-    print(f"    {len(RealDetector.MODEL_PATHS)} weight paths verified")
+    print(f"    {len(all_paths)} weight paths verified")
 
 
 def check_original_modules_importable():
@@ -205,18 +208,28 @@ def check_real_detector_contract():
           f"screw_entropy={screw_entropy} - contract + filter hold")
 
 
-def check_real_detector_seg_guard():
-    """The unported segmentation model id must fail loudly, not mis-detect."""
+def check_real_detector_seg_model():
+    """model_id=4 (screen/screen_frame) returns oriented bboxes, no UQ."""
+    from managed_system.core import DetectionResult
     det = _get_real_detector()
-    _require_uq_stack()
 
     image = np.full((720, 1280, 3), 128, dtype=np.uint8)
-    try:
-        det.detect(image, model_id=4)
-    except NotImplementedError:
-        return
-    raise AssertionError("detect(model_id=4) must raise NotImplementedError "
-                         "(segmentation path is not ported)")
+    results, screw_entropy = det.detect(image, model_id=4)
+
+    assert isinstance(results, list)
+    assert screw_entropy is None, \
+        "seg model is never adaptive; detect() must not compute an entropy"
+    for r in results:
+        assert isinstance(r, DetectionResult)
+        assert r.entropy is None
+    assert isinstance(det.last_oriented_bbox_screen, list)
+    assert isinstance(det.last_oriented_bbox_screen_frame, list)
+    for bbox in det.last_oriented_bbox_screen + det.last_oriented_bbox_screen_frame:
+        assert np.asarray(bbox).shape == (4, 2), \
+            f"oriented bbox must be 4 corner points, got shape {np.asarray(bbox).shape}"
+    print(f"    {len(results)} seg detection(s); "
+          f"screen={len(det.last_oriented_bbox_screen)} "
+          f"screen_frame={len(det.last_oriented_bbox_screen_frame)}")
 
 
 def check_real_camera():
@@ -277,7 +290,7 @@ if __name__ == "__main__":
             check_calibration_data,
             check_real_detector_class_names,
             check_real_detector_contract,
-            check_real_detector_seg_guard,
+            check_real_detector_seg_model,
             check_real_camera,
             check_real_rtde,
         ],

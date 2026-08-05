@@ -258,7 +258,7 @@ phase = if anomaly_detected then 1
         else if (default(phase[1], 0) == 1 || default(phase[1], 0) == 2) && !in_planning.in_planning then 0
         else default(phase[1], 0)
 
-phase_entered_t = if phase != default(phase[1], 0) then t else default(phase_entered_t[1], 0.0)
+phase_entered_t = if !(phase == default(phase[1], 0)) then t else default(phase_entered_t[1], 0.0)
 
 episode_start_t = if anomaly_detected then t else default(episode_start_t[1], 0.0)
 
@@ -318,13 +318,13 @@ v_missed_anomaly = degraded_since >= 0.0 && (t - degraded_since) > anomaly_grace
 
 // ---- P6: state-machine conformance - the core property is
 // v_unlegitimated_execution (no actuation without a validated plan) ----
-v_overlapping_anomaly = anomaly_detected && default(phase[1], 0) != 0
+v_overlapping_anomaly = anomaly_detected && !(default(phase[1], 0) == 0)
 
-v_unsolicited_plan = plan_generated && default(phase[1], 0) != 1
+v_unsolicited_plan = plan_generated && !(default(phase[1], 0) == 1)
 
-v_unsolicited_verdict = (plan_validated || plan_rejected) && default(phase[1], 0) != 2
+v_unsolicited_verdict = (plan_validated || plan_rejected) && !(default(phase[1], 0) == 2)
 
-v_unlegitimated_execution = plan_executed && default(phase[1], 0) != 3
+v_unlegitimated_execution = plan_executed && !(default(phase[1], 0) == 3)
 
 // ---- P7: each phase must be left within its deadline ----
 v_plan_timeout = phase == 1 && (t - phase_entered_t) > plan_deadline
@@ -334,7 +334,7 @@ v_legit_timeout = phase == 2 && (t - phase_entered_t) > legit_deadline
 v_execute_timeout = phase == 3 && (t - phase_entered_t) > execute_deadline
 
 // ---- P8: the whole episode ends (execute or abort) within its bound ----
-v_episode_timeout = phase != 0 && (t - episode_start_t) > episode_deadline
+v_episode_timeout = !(phase == 0) && (t - episode_start_t) > episode_deadline
 
 // ---- P9: candidate is a known model and differs from the active one -
 // a self-swap can never clear the anomaly that started the episode
@@ -367,7 +367,7 @@ rejections = if anomaly_detected then 0
 
 v_replan_budget = plan_rejected && rejections > max_replans
 
-v_counter_leak = anomaly_detected && replanning_counter.count != 0
+v_counter_leak = anomaly_detected && !(replanning_counter.count == 0)
 
 // ---- P12: decision, command and resulting state all agree ----
 v_execute_mismatch = plan_executed
@@ -377,7 +377,7 @@ v_execute_mismatch = plan_executed
 
 // ---- P13: clean slate for judging the new model ----
 v_post_reset = plan_executed
-             && (entropy_window_len != 0 || in_planning.in_planning || replanning_counter.count != 0)
+             && (!(entropy_window_len == 0) || in_planning.in_planning || !(replanning_counter.count == 0))
 
 // ---- P14: Legitimate validated on PAST frames; once the window refills
 // with LIVE frames the average must be back under the threshold ----
@@ -404,8 +404,8 @@ model2 = if plan_executed then default(model1[1], -1) else default(model2[1], -1
 
 v_ping_pong = plan_executed
            && default(model2[1], -1) == active_model.model_id
-           && default(model1[1], -1) != active_model.model_id
-           && default(model2[1], -1) != -1
+           && !(default(model1[1], -1) == active_model.model_id)
+           && !(default(model2[1], -1) == -1)
            && (t - default(swap2_t[1], sentinel_past_t)) < stability_window
 
 // ---- aggregated verdicts ----

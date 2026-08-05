@@ -19,6 +19,17 @@ by the RV team; this is the contract they implement against.
 * This README — how to derive the input streams from the running system,
   the tick model, and the property catalogue in prose (written against the
   LOLA file; the mapping is the same for the `.dsrv` port modulo syntax).
+* [`maple_k_events_only.dsrv`](maple_k_events_only.dsrv) — a reduced port for
+  checkers run with `--redis-input --redis-output` (pure pub/sub, no
+  redis `GET`). `maple_k.dsrv` assumes the monitor can also read knowledge
+  objects (entropy history, brightness, model ids, legit results, action
+  commands), but those are only ever written via redis `SET`
+  (`KnowledgeManager.write`), never `PUBLISH`ed — confirmed by reading
+  `rpclpy/node.py`. A pure-subscribe checker can only see the 8 bare event
+  occurrences, so this file keeps just the properties computable from event
+  occurrence + timing (P1, P6, P7, P8, and the event-countable halves of
+  P11/P15) and documents which of the 15 properties it had to drop, and why,
+  in its own header.
 
 The LOLA file uses only the common core of the language (`in`/`out`
 declarations, bounded past references `s[-1, default]`, `if-then-else`,

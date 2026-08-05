@@ -1,0 +1,208 @@
+// Run with:
+// cargo run -- examples/screw_detection_maple.dsrv --redis-input --redis-output
+//
+// Also run the clock publisher in a separate terminal:
+//   bash scripts/heartbeat_t.sh
+//
+// ===========================================================================
+// EVENTS-ONLY TRUSTWORTHINESS SPECIFICATION for the MAPLE-K adaptation loop.
+//
+// This file keeps ONLY the properties derivable from event occurrence + timing
+// with no knowledge read (P1, P6, P7, P8, P11 partial, P15 partial).
+// See the header comment history for the full reasoning.
+//
+// WHY INPUTS ARE Struct, NOT Bool
+// --------------------------------
+// rpclpy's publish_event() publishes a JSON object on each channel:
+//   {"detection_type": "...", "uid": "<uuid>", "timestamp": "<iso8601>"}
+// The TC checker's Redis backend deserializes this as Value::Map, then
+// tries to cast to Bool (as the type annotation said) → panic in
+// stream_casting.rs: Type error: ().
+//
+// Fix: declare each event input as Struct<uid: Str, timestamp: Str, ...>
+// so the Map is accepted as-is. Then derive a boolean pulse by comparing
+// the uid field to the previous tick's uid — a uid change means a new
+// event just fired on that channel (each event gets a unique uuid).
+//
+// WHY t IS A SEPARATE CHANNEL
+// ----------------------------
+// rpclpy never publishes a monotonic clock. Run scripts/heartbeat_t.sh
+// alongside the app to publish t as wall-clock seconds at 1 Hz.
+// Without t, all deadline checks (P1, P7, P8) silently produce NoVal
+// and the violation output will be incomplete.
+// ===========================================================================
+
+// ---------------------------------------------------------------------
+// IN DECLARATIONS
+// ---------------------------------------------------------------------
+
+in t: Float      // monitor-supplied monotonic seconds — publish via scripts/heartbeat_t.sh
+
+// Real Redis pub/sub channels from rpclpy.
+// Payload is a JSON object; uid is the unique event identifier.
+in sensor_data_received: Struct<uid: Str, timestamp: Str, ...>
+in observation_recorded: Struct<uid: Str, timestamp: Str, ...>
+in detection_completed: Struct<uid: Str, timestamp: Str, ...>
+in anomaly_detected: Struct<uid: Str, timestamp: Str, ...>
+in plan_generated: Struct<uid: Str, timestamp: Str, ...>
+in plan_validated: Struct<uid: Str, timestamp: Str, ...>
+in plan_rejected: Struct<uid: Str, timestamp: Str, ...>
+in plan_executed: Struct<uid: Str, timestamp: Str, ...>
+
+// ---------------------------------------------------------------------
+// AUX — boolean pulses derived from uid comparison
+// true only on the tick when a new uid arrives (= a new event fired)
+// default(..., false) guards the first tick when no previous value exists
+// ---------------------------------------------------------------------
+
+aux sensor_data_received_fired: Bool
+aux observation_recorded_fired: Bool
+aux detection_completed_fired: Bool
+aux anomaly_detected_fired: Bool
+aux plan_generated_fired: Bool
+aux plan_validated_fired: Bool
+aux plan_rejected_fired: Bool
+aux plan_executed_fired: Bool
+
+// ---------------------------------------------------------------------
+// OUT DECLARATIONS
+// ---------------------------------------------------------------------
+
+out max_replans: Int
+out capture_deadline: Float
+out detection_deadline: Float
+out plan_deadline: Float
+out legit_deadline: Float
+out execute_deadline: Float
+out episode_deadline: Float
+out stability_window: Float
+out sentinel_past_t: Float
+
+out phase: Int
+out phase_entered_t: Float
+out episode_start_t: Float
+
+// ---- P1 ----
+out awaiting_capture: Bool
+out sensor_t: Float
+out v_capture_timeout: Bool
+out awaiting_detection: Bool
+out observation_t: Float
+out v_detection_timeout: Bool
+
+// ---- P6 ----
+out v_overlapping_anomaly: Bool
+out v_unsolicited_plan: Bool
+out v_unsolicited_verdict: Bool
+out v_unlegitimated_execution: Bool
+
+// ---- P7 ----
+out v_plan_timeout: Bool
+out v_legit_timeout: Bool
+out v_execute_timeout: Bool
+
+// ---- P8 ----
+out v_episode_timeout: Bool
+
+// ---- P11 ----
+out rejections: Int
+out v_replan_budget: Bool
+
+// ---- P15 ----
+out swap1_t: Float
+out swap2_t: Float
+out swap3_t: Float
+out v_thrashing: Bool
+
+// ---- aggregated verdict ----
+out violation: Bool
+
+// ---------------------------------------------------------------------
+// DEFINITIONS
+// ---------------------------------------------------------------------
+
+max_replans       = 3
+capture_deadline  = 5.0
+detection_deadline = 20.0
+plan_deadline     = 10.0
+legit_deadline    = 60.0
+execute_deadline  = 10.0
+episode_deadline  = 120.0
+stability_window  = 600.0
+sentinel_past_t   = -1000000000.0
+
+// ---- pulse derivation ----
+// A pulse is true on the tick when uid changes relative to the previous tick.
+// default(..., false) handles the case where the channel has never published.
+sensor_data_received_fired  = default(!(sensor_data_received.uid  == default(sensor_data_received[1].uid,  "")), false)
+observation_recorded_fired  = default(!(observation_recorded.uid  == default(observation_recorded[1].uid,  "")), false)
+detection_completed_fired   = default(!(detection_completed.uid   == default(detection_completed[1].uid,   "")), false)
+anomaly_detected_fired      = default(!(anomaly_detected.uid      == default(anomaly_detected[1].uid,      "")), false)
+plan_generated_fired        = default(!(plan_generated.uid        == default(plan_generated[1].uid,        "")), false)
+plan_validated_fired        = default(!(plan_validated.uid        == default(plan_validated[1].uid,        "")), false)
+plan_rejected_fired         = default(!(plan_rejected.uid         == default(plan_rejected[1].uid,         "")), false)
+plan_executed_fired         = default(!(plan_executed.uid         == default(plan_executed[1].uid,         "")), false)
+
+// ---- episode state machine ----
+phase = if anomaly_detected_fired  then 1
+        else if plan_generated_fired   then 2
+        else if plan_rejected_fired    then 1
+        else if plan_validated_fired   then 3
+        else if plan_executed_fired    then 0
+        else default(phase[1], 0)
+
+phase_entered_t = if !(phase == default(phase[1], 0)) then t else default(phase_entered_t[1], 0.0)
+
+episode_start_t = if anomaly_detected_fired then t else default(episode_start_t[1], 0.0)
+
+// ---- P1 ----
+awaiting_capture = if sensor_data_received_fired then true
+                    else if observation_recorded_fired then false
+                    else default(awaiting_capture[1], false)
+
+sensor_t = if sensor_data_received_fired then t else default(sensor_t[1], 0.0)
+
+v_capture_timeout = awaiting_capture && (t - sensor_t) > capture_deadline
+
+awaiting_detection = if observation_recorded_fired then true
+                      else if detection_completed_fired then false
+                      else default(awaiting_detection[1], false)
+
+observation_t = if observation_recorded_fired then t else default(observation_t[1], 0.0)
+
+v_detection_timeout = awaiting_detection && (t - observation_t) > detection_deadline
+
+// ---- P6 ----
+v_overlapping_anomaly    = anomaly_detected_fired  && !(default(phase[1], 0) == 0)
+v_unsolicited_plan       = plan_generated_fired    && !(default(phase[1], 0) == 1)
+v_unsolicited_verdict    = (plan_validated_fired || plan_rejected_fired) && !(default(phase[1], 0) == 2)
+v_unlegitimated_execution = plan_executed_fired   && !(default(phase[1], 0) == 3)
+
+// ---- P7 ----
+v_plan_timeout    = phase == 1 && (t - phase_entered_t) > plan_deadline
+v_legit_timeout   = phase == 2 && (t - phase_entered_t) > legit_deadline
+v_execute_timeout = phase == 3 && (t - phase_entered_t) > execute_deadline
+
+// ---- P8 ----
+v_episode_timeout = !(phase == 0) && (t - episode_start_t) > episode_deadline
+
+// ---- P11 ----
+rejections = if anomaly_detected_fired then 0
+             else if plan_rejected_fired then default(rejections[1], 0) + 1
+             else default(rejections[1], 0)
+
+v_replan_budget = plan_rejected_fired && rejections > max_replans
+
+// ---- P15 ----
+swap1_t = if plan_executed_fired then t else default(swap1_t[1], sentinel_past_t)
+swap2_t = if plan_executed_fired then default(swap1_t[1], sentinel_past_t) else default(swap2_t[1], sentinel_past_t)
+swap3_t = if plan_executed_fired then default(swap2_t[1], sentinel_past_t) else default(swap3_t[1], sentinel_past_t)
+v_thrashing = plan_executed_fired && (t - swap3_t) < stability_window
+
+// ---- aggregated verdict ----
+violation = v_capture_timeout || v_detection_timeout
+         || v_overlapping_anomaly || v_unsolicited_plan || v_unsolicited_verdict || v_unlegitimated_execution
+         || v_plan_timeout || v_legit_timeout || v_execute_timeout
+         || v_episode_timeout
+         || v_replan_budget
+         || v_thrashing

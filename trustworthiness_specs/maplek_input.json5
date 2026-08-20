@@ -1,0 +1,54 @@
+{
+  // Input source configuration for screw_detection_maple_full.dsrv
+  // Run with: cargo run -- examples/screw_detection_maple_full.dsrv
+  //                        --input-config examples/screw_detection_maple_input.json5
+  //                        --redis-output
+  sources: {
+
+    // ── Pub/Sub events ────────────────────────────────────────────────────────
+    // rpclpy's publish_event() publishes to these bare channel names.
+    // Payload is always a JSON object: {"uid": "<uuid>", "timestamp": "..."}.
+    "maple-events": {
+      kind: "redis",
+      host: "localhost",
+      routes: {
+        t:                       "t",                       // published by heartbeat_t.sh
+        sensor_data_received:    "sensor_data_received",
+        observation_recorded:    "observation_recorded",
+        detection_completed:     "detection_completed",
+        anomaly_detected:        "anomaly_detected",
+        plan_generated:          "plan_generated",
+        plan_validated:          "plan_validated",
+        plan_rejected:           "plan_rejected",
+        plan_executed:           "plan_executed",
+      },
+    },
+
+    // ── Knowledge state (Redis keys) ──────────────────────────────────────────
+    // rpclpy's write_knowledge_as_object() stores these in Redis database 2.
+    // Each value is a JSON object with domain fields plus uid/timestamp stamps.
+    //
+    // IMPORTANT: the right-hand side values are the actual Redis key names
+    // as written by rpclpy's KnowledgeManager. Check your system with:
+    //   redis-cli -n 2 KEYS "*"
+    // and update the key names below to match what you find.
+    "maple-knowledge": {
+      kind: "redis-knowledge",
+      host: "localhost",
+      database: 2,
+      publish_initial: true,   // emit current key values when checker starts
+      keys: {
+        frame_ref:           "frame_ref",
+        entropy_history:     "entropy_history",
+        running_avg_entropy: "running_avg_entropy",
+        in_planning:         "in_planning",
+        replanning_counter:  "replanning_counter",
+        active_model:        "active_model",
+        candidate_model:     "candidate_model",
+        legit_result:        "legit_result",
+        action_command:      "action_command",
+      },
+    },
+
+  },
+}

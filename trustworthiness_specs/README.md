@@ -18,6 +18,8 @@ by the RV team; this is the contract they implement against.
 * [`tc_dashboard.py`](tc_dashboard.py) and
   [`test_tc_dashboard_redis.py`](test_tc_dashboard_redis.py) — a live view of
   the checker's output streams, and a fake publisher to exercise it (§6).
+* [`violation_simulation.py`](violation_simulation.py) — a fault-injecting driver that plays the
+  managing system and walks the checker into each violation on purpose (§7).
 * This README — how to derive the input streams from the running system, the
   tick model, and the property catalogue in prose.
 
@@ -243,3 +245,122 @@ python test_tc_dashboard_redis.py --dsrv-file maple_k.dsrv --rounds 2 --interval
 
 Requires `dash` and `redis` (both in [`requirements.txt`](../requirements.txt))
 and a redis server on `127.0.0.1:6379`.
+
+
+---
+
+## 7. Fault-injection driver
+
+[`simulation.py`](simulation.py) is the *input* side of the checker: it
+publishes the 8 event channels, the `t` clock and the 9 knowledge keys itself,
+following the protocol faithfully except in one deliberate place per scenario.
+It exists because most of these properties cannot be provoked from the real
+loop without patching production code — you cannot easily ask `Legitimate` to
+contradict its own verdict, or wedge `Analysis` on demand.
+
+```powershell
+python simulation.py --list
+python simulation.py --scenario counter-leak
+python simulation.py --scenario all
+```
+
+25 scenarios, one per violation stream (`--list` prints the catalogue with the
+property each one targets). Run the checker and
+[`tc_dashboard.py`](tc_dashboard.py) alongside it and the matching bar turns
+red.
+
+**Virtual clock.** `t` comes from this process, so time is ours: a wait jumps
+straight to its target in one tick, turning the 120 s `episode_deadline` into a
+single tick rather than a two-minute sit. The spec's deadlines are untouched —
+this works because every `v_*_timeout` is level-triggered, so landing one tick
+past a deadline is enough to observe it.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--scenario` | `nominal` | scenario name, or `all` |
+| `--tick-step` | `1.0` | virtual seconds a plain tick advances |
+| `--tick-interval` | `0.35` | real seconds between ticks — see pacing below |
+| `--settle-ticks` | `2` | ticks between writing knowledge and publishing the event it explains |
+| `--start-t` | resume | force the virtual clock instead of resuming from `sim:last_t` |
+| `--enable-keyspace-events` | off | set `notify-keyspace-events=KA` if it is off |
+| `--event-db` / `--knowledge-db` | `0` / `2` | must match `maplek_input.json5` |
+| `--repeat` | `1` | run N times (`0` = until `Ctrl+C`) |
+| `--dry-run` | off | print the timeline, touch no redis |
+
+Each scenario ends with a recovery step that walks the checker back to phase 0
+without inventing a second finding, and `--scenario all` inserts a
+`stability_window` cooldown between scenarios so P15 does not bleed across
+them.
+
+### Getting a violation to actually appear
+
+Four things must be true, and each one fails **silently** — the checker keeps
+publishing `false` rather than erroring.
+
+1. **`notify-keyspace-events` must be on.** The checker learns about knowledge
+   writes by subscribing to `__keyspace@2__:<key>`. Redis emits nothing there
+   by default, so the checker freezes every knowledge stream at whatever
+   `publish_initial` handed it and 13 of the 15 properties can never fire.
+   Fix once with `redis-cli CONFIG SET notify-keyspace-events KA` (add
+   `notify-keyspace-events KA` to `redis.conf` to survive a restart).
+   `simulation.py` checks this at startup and warns.
+2. **`t` must be monotonic for the checker's whole lifetime.** Every deadline
+   is a `t - stored_timestamp` subtraction against values the checker is still
+   holding. Restart the clock at 0 and those differences go negative forever.
+   The clock is checkpointed in `sim:last_t`; use `--start-t 0` only when
+   restarting the checker too.
+3. **Knowledge needs a moment to land before the event that explains it.**
+   Knowledge arrives via keyspace notifications and events via pub/sub — two
+   independent streams. Publishing an anomaly in the same instant as the
+   counter write that makes it a violation lets the checker evaluate the event
+   against stale knowledge. `--settle-ticks 2` covers it; `0` reproduces the
+   race.
+4. **Do not outrun the checker.** It evaluates one tick per published `t`, at
+   roughly 2–3 ticks/s in a debug build. Publish faster and you build a
+   backlog that puts it minutes behind while it still looks alive. Waits jump
+   to their target in a single tick rather than stepping, which keeps a whole
+   scenario to a few dozen ticks.
+
+### Things worth knowing
+
+* **Scenarios are isolated on purpose.** Each one was checked against a
+  reference evaluation of `maple_k.dsrv`: it raises its own property and no
+  other. `nominal` raises nothing at all — use it to confirm the checker is
+  quiet on a healthy loop before trusting a red bar.
+* **Two properties cannot be isolated, and that is the spec talking.**
+  `v_ping_pong` always co-fires with `v_thrashing` — both compare the
+  third-most-recent swap against the same `stability_window`, so an `A → B → A`
+  oscillation is necessarily three swaps inside it. That is a real observation
+  about the specification, worth raising with the RV team.
+* **Tick ordering is an assumption.** Each step writes knowledge, publishes its
+  event, then publishes the new `t`. If the checker instead ticks on the clock
+  and reads what has arrived *since*, use `--clock-first`.
+* **db 2 holds unrelated leftovers** from earlier experiments on this machine
+  (`reading:*`, pickled rpclpy objects). Harmless — the checker only reads the
+  9 keys named in `maplek_input.json5`.
+* **One redis, not two.** WSL runs with mirrored networking here, so Windows
+  `127.0.0.1:6379` and WSL `127.0.0.1:6379` are the same server. The checker
+  runs under WSL; the simulator and dashboard run on Windows; they meet.
+
+### Findings from running this against the real checker
+
+All 25 scenarios were confirmed to raise their target property on the live
+checker (`target/debug/trustworthiness_checker maple_k.dsrv --input-config
+... --redis-output`). Three things surfaced that are worth the RV team's
+attention:
+
+* **`v_avg_mismatch` (P2) is racy by construction.** `entropy_history` and
+  `running_avg_entropy` are two separate redis keys with two separate
+  notifications, so between them the checker always sees a new window against
+  the old average and flags a mismatch. It fired as collateral in nearly every
+  scenario. The real Analysis node writes them the same way, so this will
+  produce false positives in production. It needs either a single combined
+  knowledge object or hysteresis (require the mismatch on N consecutive ticks).
+* **`v_ping_pong` cannot fire without `v_thrashing`.** Both compare the
+  third-most-recent swap against the same `stability_window`, so P15's two
+  streams are not independent.
+* **The checker hangs silently after a few thousand ticks.** It stops
+  publishing entirely while the process stays alive, with nothing on stdout and
+  no CPU burn; it then ignores all further input. Reproduced on two separate
+  instances. Restarting it is the only recovery found. Long runs need a
+  restart between batches.

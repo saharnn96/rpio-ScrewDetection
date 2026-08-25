@@ -9,9 +9,9 @@ one place so a named property fires.
 This is the *input* side of the checker. `test_tc_dashboard_redis.py` fakes
 the *output* side; this one makes a real checker produce those outputs.
 
-    python simulation.py --list
-    python simulation.py --scenario counter-leak
-    python simulation.py --scenario all
+    python violaition_simulation.py --list
+    python violaition_simulation.py --scenario counter-leak
+    python violaition_simulation.py --scenario all
 
 Nothing here imports the managing system -- the point is to reach states the
 real loop cannot easily be coaxed into (a wedged node, a leaked counter, a
@@ -37,8 +37,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import threading
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -54,6 +57,65 @@ ANOMALY_GRACE = 10.0
 STABILITY_WINDOW = 600.0
 BRIGHTNESS_MIN = 5.0
 BRIGHTNESS_MAX = 250.0
+
+# --- how long each violation stream stays true -----------------------------
+# EDGE streams are written `<event>_fired && <bad condition>`, so they are true
+# for exactly the one tick the event arrives and false again immediately after.
+# LEVEL streams are conditions over stored state and stay true every tick until
+# something clears them.
+#
+# This is the single most important thing to know when a scenario "works" and
+# the dashboard still looks green: 18 of the 29 streams are one-tick pulses, and
+# a UI that renders the *current* value at 2 Hz will simply never sample them.
+# Only the LEVEL streams can be held long enough to watch (see Sim.hold).
+EDGE, LEVEL = "edge", "level"
+
+STREAM_KIND: dict[str, str] = {
+    # P1
+    "v_capture_timeout": LEVEL,
+    "v_detection_timeout": LEVEL,
+    # P2 -- pure knowledge predicates, true while the bad window is published
+    "v_window_overflow": LEVEL,
+    "v_entropy_range": LEVEL,
+    "v_avg_range": LEVEL,
+    "v_avg_mismatch": LEVEL,
+    # P3
+    "w_brightness_range": EDGE,
+    # P4
+    "v_anomaly_unsound": EDGE,
+    # P5
+    "v_missed_anomaly": LEVEL,
+    # P6
+    "v_overlapping_anomaly": EDGE,
+    "v_unsolicited_plan": EDGE,
+    "v_unsolicited_verdict": EDGE,
+    "v_unlegitimated_execution": EDGE,
+    # P7
+    "v_plan_timeout": LEVEL,
+    "v_legit_timeout": LEVEL,
+    "v_execute_timeout": LEVEL,
+    # P8
+    "v_episode_timeout": LEVEL,
+    # P9
+    "v_candidate_unknown": EDGE,
+    "v_candidate_self_swap": EDGE,
+    # P10
+    "v_unjustified_accept": EDGE,
+    "v_unjustified_reject": EDGE,
+    "v_verdict_flag_mismatch": EDGE,
+    # P11
+    "v_replan_budget": EDGE,
+    "v_counter_leak": EDGE,
+    # P12
+    "v_execute_mismatch": EDGE,
+    # P13
+    "v_post_reset": EDGE,
+    # P14 -- guarded by assessing_effect[1], which flips false on the same tick
+    "v_ineffective_adaptation": EDGE,
+    # P15
+    "v_thrashing": EDGE,
+    "v_ping_pong": EDGE,
+}
 
 EVENT_CHANNELS = (
     "sensor_data_received",
@@ -101,6 +163,62 @@ def window_mean(values: list[float]) -> float:
     return total / length
 
 
+class Observer:
+    """Watches the checker's own output channels so a scenario can self-check.
+
+    The dashboard shows each stream's *current* value, so an EDGE violation --
+    true for one tick out of a few hundred -- is easy to miss completely. This
+    subscribes to the same channels and counts rising edges, which is what lets
+    a scenario report "v_counter_leak fired" instead of leaving you to catch a
+    red flash. Redis pub/sub is not database-scoped, so the db here is
+    irrelevant: it hears whatever the checker publishes with --redis-output.
+    """
+
+    def __init__(self, client: redis.Redis, streams: list[str]) -> None:
+        self.lock = threading.Lock()
+        self.rising: Counter = Counter()
+        self.messages = 0
+        self._last: dict[str, bool] = {}
+        self._pubsub = client.pubsub(ignore_subscribe_messages=True)
+        self._pubsub.subscribe(*streams)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _decode(raw) -> bool | None:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            lowered = text.strip().lower()
+            return True if lowered == "true" else False if lowered == "false" else None
+        return parsed if isinstance(parsed, bool) else None
+
+    def _run(self) -> None:
+        try:
+            for message in self._pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                channel = message["channel"]
+                name = channel.decode() if isinstance(channel, bytes) else str(channel)
+                value = self._decode(message.get("data"))
+                if value is None:
+                    continue
+                with self.lock:
+                    self.messages += 1
+                    # Count the transition, not the sample: the checker
+                    # republishes every stream on every tick.
+                    if value and not self._last.get(name, False):
+                        self.rising[name] += 1
+                    self._last[name] = value
+        except Exception:  # the connection dies when the process exits
+            pass
+
+    def snapshot(self) -> Counter:
+        with self.lock:
+            return Counter(self.rising)
+
+
 class Sim:
     """Drives redis on a virtual clock, tracking the phase the spec will infer."""
 
@@ -112,6 +230,7 @@ class Sim:
         self.knowledge_dirty = False
         self.knowledge = {key: dict(value) for key, value in BASELINE_KNOWLEDGE.items()}
         self.log: list[str] = []
+        self.ticks = 0
 
         if args.dry_run:
             self.events = self.kb = None
@@ -126,6 +245,11 @@ class Sim:
             self.kb.ping()
             self._check_keyspace_events()
 
+        self.observer = (
+            None
+            if self.events is None or args.no_observe
+            else Observer(self.events, sorted(STREAM_KIND))
+        )
         self.vt = self._resume_clock()
 
     def _check_keyspace_events(self) -> None:
@@ -250,6 +374,7 @@ class Sim:
         spent deliberately rather than streamed.
         """
         self.vt += self.args.tick_step if step is None else step
+        self.ticks += 1
         self._publish_clock()
         if self.events is not None:
             self.events.set(self.clock_key, repr(self.vt))
@@ -266,6 +391,35 @@ class Sim:
         if note:
             self.say(f"wait   {virtual_seconds:.0f}s virtual - {note}")
         self.tick(step=virtual_seconds)
+
+    def hold(self, note: str, ticks: int | None = None) -> None:
+        """Sit still so a LEVEL violation stays true long enough to be seen.
+
+        Nothing changes here: only `t` advances. Every `v_*_timeout` and every
+        knowledge predicate re-evaluates to true for as long as we do not clear
+        the state, which turns a one-tick blip into a bar you can read. Useless
+        for EDGE streams -- those are one tick by construction, no matter what
+        this driver does.
+        """
+        count = self.args.hold_ticks if ticks is None else ticks
+        if count <= 0:
+            return
+        self.say(f"hold   {count} ticks - {note}")
+        for _ in range(count):
+            self.tick()
+
+    def other_model(self) -> int:
+        """A valid model id that is not the active one.
+
+        Scenarios used to hard-code candidate 3 while an earlier scenario had
+        already left `active_model` at 3, so `--scenario all` raised
+        `v_candidate_self_swap` as collateral in eight different places.
+        """
+        active = self.knowledge["active_model"]["model_id"]
+        for candidate in range(MIN_MODEL_ID, MAX_MODEL_ID + 1):
+            if candidate != active:
+                return candidate
+        return MAX_MODEL_ID
 
     # -- reusable protocol fragments ---------------------------------------
 
@@ -306,9 +460,16 @@ class Sim:
                 current_avg_entropy=0.55,
             )
             self.finish_episode(candidate)
+            # P14 watches from a swap until the window refills. Refill it with a
+            # healthy value here, or assessing_effect stays armed and the *next*
+            # scenario's degraded window raises v_ineffective_adaptation for free.
+            self.fill_window(0.20)
 
         self.write("replanning_counter", count=0)
         self.write("in_planning", in_planning=False)
+        # Back to the baseline model: `active_model` survives `recover` otherwise,
+        # and a later scenario picking the same candidate raises P9 for free.
+        self.write("active_model", model_id=BASELINE_KNOWLEDGE["active_model"]["model_id"])
         self.set_window([])
         self.tick()
 
@@ -360,14 +521,15 @@ class Sim:
         `plan_gap` is spent in phase 1 (10 s deadline) and `verdict_gap` in
         phase 2 (60 s) -- keep each under its own deadline to isolate P8/P11.
         """
+        candidate = self.other_model()
         self.advance(plan_gap)
-        self.write("candidate_model", model_id=3)
+        self.write("candidate_model", model_id=candidate)
         self.emit("plan_generated")
         self.advance(verdict_gap)
         self.write(
             "legit_result",
             is_legit=False,
-            candidate_model_id=3,
+            candidate_model_id=candidate,
             candidate_avg_entropy=0.60,
             current_avg_entropy=0.50,
         )
@@ -391,6 +553,7 @@ def sc_nominal(sim: Sim) -> None:
 def sc_capture_timeout(sim: Sim) -> None:
     sim.emit("sensor_data_received", detection_type="screw")
     sim.advance(8.0, "Monitor never answers (capture_deadline is 5s)")
+    sim.hold("v_capture_timeout holds until observation_recorded arrives")
     sim.emit("observation_recorded")  # late, clears the flag
     sim.emit("detection_completed")
 
@@ -399,12 +562,14 @@ def sc_detection_timeout(sim: Sim) -> None:
     sim.emit("sensor_data_received", detection_type="screw")
     sim.emit("observation_recorded")
     sim.advance(25.0, "Analysis is wedged (detection_deadline is 20s)")
+    sim.hold("v_detection_timeout holds until detection_completed arrives")
     sim.emit("detection_completed")
 
 
 def sc_window_overflow(sim: Sim) -> None:
     sim.set_window([0.2] * (ENTROPY_WINDOW_SIZE + 2))
     sim.advance(3.0, "window holds 12 samples, configured size is 10")
+    sim.hold("v_window_overflow holds while the oversized window is published")
     sim.set_window([])
 
 
@@ -412,6 +577,7 @@ def sc_entropy_range(sim: Sim) -> None:
     # 1.7 is outside [0,1]; the other samples keep the mean low so nothing else fires.
     sim.set_window([0.1] * 9 + [1.7])
     sim.advance(3.0, "one sample outside [0,1]")
+    sim.hold("v_entropy_range holds while the bad sample is in the window")
     sim.set_window([])
 
 
@@ -419,6 +585,7 @@ def sc_avg_range(sim: Sim) -> None:
     # Empty window: len 0 disables the mismatch check, isolating v_avg_range.
     sim.set_window([], avg=1.5)
     sim.advance(3.0, "running average 1.5 with an empty window")
+    sim.hold("v_avg_range holds while the average stays above 1.0")
     sim.set_window([])
 
 
@@ -426,6 +593,7 @@ def sc_avg_mismatch(sim: Sim) -> None:
     sim.write("in_planning", in_planning=True)  # suppress P5 while we sit here
     sim.set_window([0.2] * ENTROPY_WINDOW_SIZE, avg=0.9)
     sim.advance(3.0, "published average 0.9, true mean 0.2")
+    sim.hold("v_avg_mismatch holds while window and average disagree")
     sim.set_window([])
     sim.write("in_planning", in_planning=False)
 
@@ -448,24 +616,26 @@ def sc_anomaly_unsound(sim: Sim) -> None:
 def sc_missed_anomaly(sim: Sim) -> None:
     sim.fill_window(0.55)  # degraded and nobody is adapting
     sim.advance(ANOMALY_GRACE + 4.0, "degraded window, no anomaly raised")
+    sim.hold("v_missed_anomaly holds until the window is cleared")
     sim.set_window([])
 
 
 def sc_unlegitimated_execution(sim: Sim) -> None:
     # Everything else about the execution is consistent -- only the protocol is broken.
+    candidate = sim.other_model()
     sim.write(
         "legit_result",
         is_legit=True,
-        candidate_model_id=3,
+        candidate_model_id=candidate,
         candidate_avg_entropy=0.20,
         current_avg_entropy=0.55,
     )
-    sim.finish_episode(3)  # straight from idle: no anomaly, no plan, no verdict
+    sim.finish_episode(candidate)  # straight from idle: no anomaly, plan or verdict
     sim.fill_window(0.20)
 
 
 def sc_unsolicited_plan(sim: Sim) -> None:
-    sim.write("candidate_model", model_id=3)
+    sim.write("candidate_model", model_id=sim.other_model())
     sim.emit("plan_generated")  # phase is idle, nobody asked for a plan
     sim.advance(2.0)
 
@@ -473,18 +643,21 @@ def sc_unsolicited_plan(sim: Sim) -> None:
 def sc_plan_timeout(sim: Sim) -> None:
     sim.open_episode()
     sim.advance(13.0, "Plan never responds (plan_deadline is 10s)")
+    sim.hold("v_plan_timeout holds while phase 1 keeps waiting")
 
 
 def sc_episode_timeout(sim: Sim) -> None:
     # Keep the per-step clocks fresh by cycling plan/reject, so only the
     # whole-episode bound is exceeded. Two rejections stay inside the budget.
+    candidate = sim.other_model()
     sim.open_episode()
     sim.reject_cycle(plan_gap=3.0, verdict_gap=50.0, counter=1)
     sim.reject_cycle(plan_gap=3.0, verdict_gap=50.0, counter=2)
     sim.advance(3.0)
-    sim.write("candidate_model", model_id=3)
+    sim.write("candidate_model", model_id=candidate)
     sim.emit("plan_generated")
     sim.advance(20.0, "episode past 120s while each step is still inside its deadline")
+    sim.hold("v_episode_timeout holds until the episode closes")
 
 
 def sc_candidate_self_swap(sim: Sim) -> None:
@@ -505,36 +678,38 @@ def sc_candidate_unknown(sim: Sim) -> None:
 
 
 def sc_unjustified_accept(sim: Sim) -> None:
+    candidate = sim.other_model()
     sim.open_episode()
     sim.advance(2.0)
-    sim.write("candidate_model", model_id=3)
+    sim.write("candidate_model", model_id=candidate)
     sim.emit("plan_generated")
     sim.advance(3.0)
     # Candidate is worse than the incumbent and over threshold: the rule says reject.
     sim.write(
         "legit_result",
         is_legit=True,
-        candidate_model_id=3,
+        candidate_model_id=candidate,
         candidate_avg_entropy=0.60,
         current_avg_entropy=0.50,
     )
     sim.emit("plan_validated")
     sim.advance(3.0)
-    sim.finish_episode(3)
+    sim.finish_episode(candidate)
     sim.fill_window(0.20)
 
 
 def sc_verdict_flag_mismatch(sim: Sim) -> None:
+    candidate = sim.other_model()
     sim.open_episode()
     sim.advance(2.0)
-    sim.write("candidate_model", model_id=3)
+    sim.write("candidate_model", model_id=candidate)
     sim.emit("plan_generated")
     sim.advance(3.0)
     # The rule accepts and the event says validated, but the published flag says no.
     sim.write(
         "legit_result",
         is_legit=False,
-        candidate_model_id=3,
+        candidate_model_id=candidate,
         candidate_avg_entropy=0.20,
         current_avg_entropy=0.55,
     )
@@ -558,64 +733,140 @@ def sc_counter_leak(sim: Sim) -> None:
 
 
 def sc_execute_mismatch(sim: Sim) -> None:
+    candidate = sim.other_model()
     sim.open_episode()
     sim.advance(2.0)
-    sim.write("candidate_model", model_id=3)
+    sim.write("candidate_model", model_id=candidate)
     sim.emit("plan_generated")
     sim.advance(3.0)
     sim.write(
         "legit_result",
         is_legit=True,
-        candidate_model_id=3,
+        candidate_model_id=candidate,
         candidate_avg_entropy=0.20,
         current_avg_entropy=0.55,
     )
     sim.emit("plan_validated")
     sim.advance(3.0)
-    sim.finish_episode(3, action_model=MAX_MODEL_ID)  # actuated a different model
+    sim.finish_episode(candidate, action_model=MAX_MODEL_ID)  # actuated a different model
     sim.fill_window(0.20)
 
 
 def sc_post_reset(sim: Sim) -> None:
+    candidate = sim.other_model()
     sim.open_episode()
     sim.advance(2.0)
-    sim.write("candidate_model", model_id=3)
+    sim.write("candidate_model", model_id=candidate)
     sim.emit("plan_generated")
     sim.advance(3.0)
     sim.write(
         "legit_result",
         is_legit=True,
-        candidate_model_id=3,
+        candidate_model_id=candidate,
         candidate_avg_entropy=0.20,
         current_avg_entropy=0.55,
     )
     sim.emit("plan_validated")
     sim.advance(3.0)
     # Swap done, but the window was never cleared and the counter still holds 1.
-    sim.finish_episode(3, counter=1, window=[0.2, 0.2, 0.2])
+    sim.finish_episode(candidate, counter=1, window=[0.2, 0.2, 0.2])
     sim.write("replanning_counter", count=0)
     sim.fill_window(0.20)
 
 
 def sc_ineffective_adaptation(sim: Sim) -> None:
+    candidate = sim.other_model()
     sim.open_episode()
     sim.advance(2.0)
-    sim.write("candidate_model", model_id=3)
+    sim.write("candidate_model", model_id=candidate)
     sim.emit("plan_generated")
     sim.advance(3.0)
     sim.write(
         "legit_result",
         is_legit=True,
-        candidate_model_id=3,
+        candidate_model_id=candidate,
         candidate_avg_entropy=0.20,
         current_avg_entropy=0.55,
     )
     sim.emit("plan_validated")
     sim.advance(3.0)
-    sim.finish_episode(3)
+    sim.finish_episode(candidate)
     # The new model is no better: the refilled window is still over threshold.
     sim.fill_window(0.55)
     sim.set_window([])
+
+
+def sc_overlapping_anomaly(sim: Sim) -> None:
+    # A second anomaly while the first episode is still open (phase 1, not 0).
+    sim.open_episode()
+    sim.advance(2.0)
+    sim.emit("anomaly_detected")
+    sim.advance(2.0)
+
+
+def sc_unsolicited_verdict(sim: Sim) -> None:
+    # A verdict with no plan to judge. The verdict itself is internally sound,
+    # so only the protocol stream fires.
+    candidate = sim.other_model()
+    sim.write(
+        "legit_result",
+        is_legit=True,
+        candidate_model_id=candidate,
+        candidate_avg_entropy=0.20,
+        current_avg_entropy=0.55,
+    )
+    sim.emit("plan_validated")  # phase is idle, nobody asked for a verdict
+    sim.advance(2.0)
+
+
+def sc_legit_timeout(sim: Sim) -> None:
+    sim.open_episode()
+    sim.advance(2.0)
+    sim.write("candidate_model", model_id=sim.other_model())
+    sim.emit("plan_generated")
+    sim.advance(65.0, "Legitimate never answers (legit_deadline is 60s)")
+    sim.hold("v_legit_timeout holds while phase 2 keeps waiting")
+
+
+def sc_execute_timeout(sim: Sim) -> None:
+    candidate = sim.other_model()
+    sim.open_episode()
+    sim.advance(2.0)
+    sim.write("candidate_model", model_id=candidate)
+    sim.emit("plan_generated")
+    sim.advance(3.0)
+    sim.write(
+        "legit_result",
+        is_legit=True,
+        candidate_model_id=candidate,
+        candidate_avg_entropy=0.20,
+        current_avg_entropy=0.55,
+    )
+    sim.emit("plan_validated")
+    sim.advance(13.0, "Execute never actuates (execute_deadline is 10s)")
+    sim.hold("v_execute_timeout holds while phase 3 keeps waiting")
+
+
+def sc_unjustified_reject(sim: Sim) -> None:
+    candidate = sim.other_model()
+    sim.open_episode()
+    sim.advance(2.0)
+    sim.write("candidate_model", model_id=candidate)
+    sim.emit("plan_generated")
+    sim.advance(3.0)
+    # The rule plainly accepts this candidate -- rejecting it is the violation.
+    # is_legit stays false so the verdict agrees with the event (no P10 flag
+    # mismatch on top).
+    sim.write(
+        "legit_result",
+        is_legit=False,
+        candidate_model_id=candidate,
+        candidate_avg_entropy=0.20,
+        current_avg_entropy=0.55,
+    )
+    sim.write("replanning_counter", count=1)
+    sim.emit("plan_rejected")
+    sim.advance(2.0)
 
 
 def sc_thrashing(sim: Sim) -> None:
@@ -642,13 +893,18 @@ SCENARIOS: dict[str, tuple[str, str, Callable[[Sim], None]]] = {
     "brightness": ("P3 w_brightness_range", "frame far too dark (warning only)", sc_brightness),
     "anomaly-unsound": ("P4 v_anomaly_unsound", "anomaly on a partial, healthy window", sc_anomaly_unsound),
     "missed-anomaly": ("P5 v_missed_anomaly", "degraded past the grace period, no anomaly", sc_missed_anomaly),
+    "overlapping-anomaly": ("P6 v_overlapping_anomaly", "second anomaly inside an open episode", sc_overlapping_anomaly),
     "unlegitimated-execution": ("P6 v_unlegitimated_execution", "actuation with no validated plan", sc_unlegitimated_execution),
     "unsolicited-plan": ("P6 v_unsolicited_plan", "plan produced with no anomaly open", sc_unsolicited_plan),
+    "unsolicited-verdict": ("P6 v_unsolicited_verdict", "verdict with no plan to judge", sc_unsolicited_verdict),
     "plan-timeout": ("P7 v_plan_timeout", "Plan misses its deadline", sc_plan_timeout),
+    "legit-timeout": ("P7 v_legit_timeout", "Legitimate misses its deadline", sc_legit_timeout),
+    "execute-timeout": ("P7 v_execute_timeout", "Execute misses its deadline", sc_execute_timeout),
     "episode-timeout": ("P8 v_episode_timeout", "episode outlives 120s, every step in time", sc_episode_timeout),
     "candidate-self-swap": ("P9 v_candidate_self_swap", "candidate equals the active model", sc_candidate_self_swap),
     "candidate-unknown": ("P9 v_candidate_unknown", "candidate model id out of range", sc_candidate_unknown),
     "unjustified-accept": ("P10 v_unjustified_accept", "validated against its own rule", sc_unjustified_accept),
+    "unjustified-reject": ("P10 v_unjustified_reject", "rejected against its own rule", sc_unjustified_reject),
     "verdict-flag-mismatch": ("P10 v_verdict_flag_mismatch", "is_legit disagrees with the event", sc_verdict_flag_mismatch),
     "replan-budget": ("P11 v_replan_budget", "a fourth rejection in one episode", sc_replan_budget),
     "counter-leak": ("P11 v_counter_leak", "episode opens with a leaked counter", sc_counter_leak),
@@ -658,6 +914,30 @@ SCENARIOS: dict[str, tuple[str, str, Callable[[Sim], None]]] = {
     "thrashing": ("P15 v_thrashing", "three swaps inside the stability window", sc_thrashing),
     "ping-pong": ("P15 v_ping_pong", "model A -> B -> A (also trips v_thrashing)", sc_ping_pong),
 }
+
+
+# Streams a scenario raises *in addition* to the one named in its catalogue
+# entry, because the specification cannot separate them.
+EXTRA_STREAMS: dict[str, tuple[str, ...]] = {
+    # An A -> B -> A oscillation is necessarily three swaps inside the same
+    # stability window, so v_thrashing cannot be avoided here. See README.
+    "ping-pong": ("v_thrashing",),
+}
+
+
+def expected_streams(name: str) -> list[str]:
+    """The violation streams a scenario is supposed to raise.
+
+    Taken from the stream name embedded in the catalogue entry (e.g.
+    "P11 v_counter_leak"), plus any co-firing stream listed in EXTRA_STREAMS.
+    `nominal` names none, which is the point: anything it raises is a bug.
+    """
+    prop = SCENARIOS[name][0]
+    streams = [s for s in re.findall(r"[vw]_[a-z_]+", prop) if s in STREAM_KIND]
+    for stream in EXTRA_STREAMS.get(name, ()):
+        if stream not in streams:
+            streams.append(stream)
+    return streams
 
 
 def parse_args() -> argparse.Namespace:
@@ -714,6 +994,28 @@ def parse_args() -> argparse.Namespace:
         "redis; use 0 only when restarting the checker as well",
     )
     parser.add_argument(
+        "--hold-ticks",
+        type=int,
+        default=6,
+        help="ticks to sit in an injected state before clearing it, so a "
+        "level-triggered violation stays true long enough for the dashboard to "
+        "sample it (0 restores the old one-tick behaviour). Has no effect on "
+        "edge-triggered streams -- those are one tick by construction",
+    )
+    parser.add_argument(
+        "--no-observe",
+        action="store_true",
+        help="do not subscribe to the checker's output channels; without this "
+        "the driver reports which expected violations actually fired",
+    )
+    parser.add_argument(
+        "--drain",
+        type=float,
+        default=1.5,
+        help="real seconds to wait after a scenario for the checker's verdicts "
+        "to arrive before judging it",
+    )
+    parser.add_argument(
         "--repeat", type=int, default=1, help="run the scenario N times (0 = forever)"
     )
     parser.add_argument("--dry-run", action="store_true", help="print the timeline, touch no redis")
@@ -723,17 +1025,90 @@ def parse_args() -> argparse.Namespace:
 
 def print_list() -> None:
     width = max(len(name) for name in SCENARIOS)
-    print(f"{'scenario'.ljust(width)}  property                       what it does")
-    print(f"{'-' * width}  {'-' * 29}  {'-' * 44}")
+    print(f"{'scenario'.ljust(width)}  property                       kind   what it does")
+    print(f"{'-' * width}  {'-' * 29}  {'-' * 5}  {'-' * 44}")
     for name, (prop, description, _) in SCENARIOS.items():
-        print(f"{name.ljust(width)}  {prop.ljust(29)}  {description}")
+        streams = expected_streams(name)
+        kinds = {STREAM_KIND[stream] for stream in streams}
+        kind = "/".join(sorted(kinds)) if kinds else "--"
+        print(f"{name.ljust(width)}  {prop.ljust(29)}  {kind.ljust(5)}  {description}")
+    print()
+    print(
+        "kind=edge means the stream is true for exactly one tick -- real, but "
+        "the dashboard shows the current value and will usually never sample "
+        "it. Trust the RESULT lines this driver prints, not the bars."
+    )
 
 
-def run_once(sim: Sim, name: str) -> None:
-    prop, description, scenario = SCENARIOS[name]
+def announce(sim: Sim, name: str, streams: list[str]) -> None:
+    """Say, before anything is injected, exactly what should turn red."""
+    prop, description, _ = SCENARIOS[name]
     sim.say(f"=== {name} -- expect {prop} ({description})")
+    if not streams:
+        sim.say("    EXPECT no violation at all -- this is the healthy baseline")
+        return
+    for stream in streams:
+        kind = STREAM_KIND[stream]
+        if kind == LEVEL:
+            ticks = sim.args.hold_ticks + 1
+            detail = (
+                f"true for ~{ticks} ticks "
+                f"(~{ticks * sim.args.tick_interval:.1f}s) -- watch the bar"
+            )
+        else:
+            detail = (
+                "true for ONE tick only -- the dashboard shows the current "
+                "value and will almost certainly miss it"
+            )
+        sim.say(f"    EXPECT {stream} -> true  [{kind}] {detail}")
+
+
+def report(sim: Sim, name: str, streams: list[str], before, after) -> str:
+    """Compare what the checker actually published against what we expected."""
+    if before is None or after is None:
+        sim.say(f"    RESULT {name}: not observed (--no-observe / --dry-run)")
+        return "unobserved"
+
+    delta = {stream: after[stream] - before[stream] for stream in set(after) | set(before)}
+    fired = [stream for stream in streams if delta.get(stream, 0) > 0]
+    missing = [stream for stream in streams if delta.get(stream, 0) == 0]
+    collateral = sorted(
+        stream for stream, count in delta.items() if count > 0 and stream not in streams
+    )
+
+    if not streams:
+        verdict = "PASS" if not collateral else "FAIL"
+    elif not missing:
+        verdict = "PASS"
+    elif fired:
+        verdict = "PARTIAL"
+    else:
+        verdict = "FAIL"
+
+    sim.say(f"    RESULT {name}: {verdict}")
+    if fired:
+        sim.say(f"      fired      {', '.join(fired)}")
+    if missing:
+        sim.say(f"      MISSING    {', '.join(missing)}")
+    if collateral:
+        sim.say(f"      collateral {', '.join(collateral)}")
+    return verdict
+
+
+def run_once(sim: Sim, name: str) -> str:
+    _, _, scenario = SCENARIOS[name]
+    streams = expected_streams(name)
+    announce(sim, name, streams)
+
+    before = sim.observer.snapshot() if sim.observer else None
     scenario(sim)
     sim.recover()
+    if sim.observer is not None:
+        # The checker is a tick or two behind us; let its verdicts land before
+        # we decide whether they arrived.
+        time.sleep(sim.args.drain)
+    after = sim.observer.snapshot() if sim.observer else None
+    return report(sim, name, streams, before, after)
 
 
 def main() -> None:
@@ -765,11 +1140,12 @@ def main() -> None:
         flush=True,
     )
 
+    verdicts: dict[str, str] = {}
     iteration = 0
     try:
         while args.repeat == 0 or iteration < args.repeat:
             for name in names:
-                run_once(sim, name)
+                verdicts[name] = run_once(sim, name)
                 if len(names) > 1:
                     # Outrun the 600s stability window so P15 does not bleed
                     # from one scenario into the next.
@@ -777,6 +1153,58 @@ def main() -> None:
             iteration += 1
     except KeyboardInterrupt:
         print("\n[sim] stopped", flush=True)
+    finally:
+        print_summary(sim, verdicts)
+
+
+def print_summary(sim: Sim, verdicts: dict[str, str]) -> None:
+    """The bottom line: what was expected, and what the checker actually said."""
+    if not verdicts:
+        return
+
+    print("\n=== summary " + "=" * 58, flush=True)
+    width = max(len(name) for name in verdicts)
+    for name, verdict in verdicts.items():
+        streams = ", ".join(expected_streams(name)) or "(none expected)"
+        print(f"  {verdict.ljust(9)} {name.ljust(width)}  {streams}", flush=True)
+
+    if sim.observer is None:
+        return
+
+    if sim.observer.messages == 0:
+        print(
+            "\n[sim] the checker published NOTHING on any violation channel: it is"
+            "\n[sim] not running, was started without --redis-output, is pointed at"
+            "\n[sim] another redis, or has silently wedged (README section 7). No"
+            "\n[sim] scenario can pass until that is fixed.",
+            flush=True,
+        )
+        return
+
+    evaluated = sim.observer.messages / max(len(STREAM_KIND), 1)
+    if sim.ticks and evaluated < sim.ticks * 0.8:
+        print(
+            f"\n[sim] the checker evaluated roughly {evaluated:.0f} of the {sim.ticks} ticks"
+            "\n[sim] published. It is running behind, so verdicts may land against the"
+            "\n[sim] wrong scenario. Raise --tick-interval, raise --drain, or run a"
+            "\n[sim] release build of the checker.",
+            flush=True,
+        )
+
+    failed = [name for name, verdict in verdicts.items() if verdict in {"FAIL", "PARTIAL"}]
+    if failed:
+        print(
+            f"\n[sim] {len(failed)} scenario(s) did not raise everything expected."
+            "\n[sim] Check notify-keyspace-events (every knowledge-driven property"
+            "\n[sim] goes quiet without it) and that t is still monotonic for this"
+            "\n[sim] checker process.",
+            flush=True,
+        )
+    else:
+        print(
+            f"\n[sim] all {len(verdicts)} scenario(s) raised their target stream.",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ by the RV team; this is the contract they implement against.
 * [`tc_dashboard.py`](tc_dashboard.py) and
   [`test_tc_dashboard_redis.py`](test_tc_dashboard_redis.py) — a live view of
   the checker's output streams, and a fake publisher to exercise it (§6).
-* [`violation_simulation.py`](violation_simulation.py) — a fault-injecting driver that plays the
+* [`violaition_simulation.py`](violaition_simulation.py) — a fault-injecting driver that plays the
   managing system and walks the checker into each violation on purpose (§7).
 * This README — how to derive the input streams from the running system, the
   tick model, and the property catalogue in prose.
@@ -251,7 +251,8 @@ and a redis server on `127.0.0.1:6379`.
 
 ## 7. Fault-injection driver
 
-[`simulation.py`](simulation.py) is the *input* side of the checker: it
+[`violaition_simulation.py`](violaition_simulation.py) is the *input* side of
+the checker (the filename's typo is the one on disk): it
 publishes the 8 event channels, the `t` clock and the 9 knowledge keys itself,
 following the protocol faithfully except in one deliberate place per scenario.
 It exists because most of these properties cannot be provoked from the real
@@ -259,15 +260,42 @@ loop without patching production code — you cannot easily ask `Legitimate` to
 contradict its own verdict, or wedge `Analysis` on demand.
 
 ```powershell
-python simulation.py --list
-python simulation.py --scenario counter-leak
-python simulation.py --scenario all
+python violaition_simulation.py --list
+python violaition_simulation.py --scenario counter-leak
+python violaition_simulation.py --scenario all
 ```
 
-25 scenarios, one per violation stream (`--list` prints the catalogue with the
-property each one targets). Run the checker and
-[`tc_dashboard.py`](tc_dashboard.py) alongside it and the matching bar turns
-red.
+30 scenarios, one per violation stream (`--list` prints the catalogue with the
+property each one targets and whether that stream is edge- or level-triggered).
+Run the checker and [`tc_dashboard.py`](tc_dashboard.py) alongside it — but read
+the next section before trusting a green bar.
+
+### Edge-triggered violations are one tick long
+
+Most streams in the spec are written `<event>_fired && <bad condition>`, so they
+are true for exactly the one tick the event arrives and false again on the next.
+18 of the 29 streams are pulses like this; only 11 are level-triggered
+conditions over stored state that stay true until something clears them.
+
+`tc_dashboard.py` renders each stream's *current* value, sampled at 2 Hz over a
+10-second window. A one-tick pulse is real, published, and correct — and the
+dashboard will still show green, because it was never sampled while the value
+was true. This is the single most common reason a scenario "does not work":
+before this was understood, `v_plan_timeout` (P7) looked like the only property
+the driver could violate, purely because `plan-timeout` was the one scenario
+that happened to leave the checker sitting in the violating state across several
+ticks.
+
+Two things follow:
+
+* `--hold-ticks` (default 6) makes every **level** scenario sit in its injected
+  state for a few extra ticks before clearing it, so the bar stays red long
+  enough to see. It cannot help the edge streams — nothing can, on the input
+  side.
+* The driver subscribes to the checker's own output channels and reports, per
+  scenario, which expected streams actually went true (`RESULT ... PASS` /
+  `PARTIAL` / `FAIL`, plus a summary table at the end). **Trust those lines over
+  the bars.** `--no-observe` turns it off.
 
 **Virtual clock.** `t` comes from this process, so time is ours: a wait jumps
 straight to its target in one tick, turning the 120 s `episode_deadline` into a
@@ -282,6 +310,9 @@ past a deadline is enough to observe it.
 | `--tick-interval` | `0.35` | real seconds between ticks — see pacing below |
 | `--settle-ticks` | `2` | ticks between writing knowledge and publishing the event it explains |
 | `--start-t` | resume | force the virtual clock instead of resuming from `sim:last_t` |
+| `--hold-ticks` | `6` | ticks to sit in an injected state before clearing it (`0` = old one-tick behaviour) |
+| `--no-observe` | off | do not watch the checker's outputs, so no `RESULT` lines |
+| `--drain` | `1.5` | real seconds to wait for the checker's verdicts before judging a scenario |
 | `--enable-keyspace-events` | off | set `notify-keyspace-events=KA` if it is off |
 | `--event-db` / `--knowledge-db` | `0` / `2` | must match `maplek_input.json5` |
 | `--repeat` | `1` | run N times (`0` = until `Ctrl+C`) |
@@ -303,7 +334,7 @@ publishing `false` rather than erroring.
    `publish_initial` handed it and 13 of the 15 properties can never fire.
    Fix once with `redis-cli CONFIG SET notify-keyspace-events KA` (add
    `notify-keyspace-events KA` to `redis.conf` to survive a restart).
-   `simulation.py` checks this at startup and warns.
+   `violaition_simulation.py` checks this at startup and warns.
 2. **`t` must be monotonic for the checker's whole lifetime.** Every deadline
    is a `t - stored_timestamp` subtraction against values the checker is still
    holding. Restart the clock at 0 and those differences go negative forever.
@@ -323,10 +354,16 @@ publishing `false` rather than erroring.
 
 ### Things worth knowing
 
-* **Scenarios are isolated on purpose.** Each one was checked against a
-  reference evaluation of `maple_k.dsrv`: it raises its own property and no
-  other. `nominal` raises nothing at all — use it to confirm the checker is
-  quiet on a healthy loop before trusting a red bar.
+* **Scenarios are isolated on purpose,** and the isolation is state-dependent.
+  Three leaks were found and closed: scenarios used to hard-code candidate
+  model 3 while an earlier scenario had already left `active_model` at 3
+  (raising `v_candidate_self_swap` for free in eight places), `recover()` did
+  not restore `active_model`, and it did not refill the entropy window after
+  the swap it performs, so `assessing_effect` stayed armed and the *next*
+  scenario's degraded window raised `v_ineffective_adaptation`. Candidates are
+  now chosen with `Sim.other_model()` against the live `active_model`.
+  `nominal` raises nothing at all — use it to confirm the checker is quiet on a
+  healthy loop before trusting a red bar.
 * **Two properties cannot be isolated, and that is the spec talking.**
   `v_ping_pong` always co-fires with `v_thrashing` — both compare the
   third-most-recent swap against the same `stability_window`, so an `A → B → A`
@@ -344,7 +381,7 @@ publishing `false` rather than erroring.
 
 ### Findings from running this against the real checker
 
-All 25 scenarios were confirmed to raise their target property on the live
+All scenarios were confirmed to raise their target property on the live
 checker (`target/debug/trustworthiness_checker maple_k.dsrv --input-config
 ... --redis-output`). Three things surfaced that are worth the RV team's
 attention:
